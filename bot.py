@@ -20,11 +20,11 @@ TIMEZONE = os.environ.get("TIMEZONE", "Europe/Belgrade")
 TODOIST_API_BASE = "https://api.todoist.com/api/v1"
 
 
-def format_tasks(tasks) -> str:
+def format_tasks(tasks, title="Задачи:") -> str:
     if not tasks:
         return "Задач нет. Можно выдохнуть."
 
-    lines = ["Задачи на сегодня:\n"]
+    lines = [f"{title}\n"]
     for t in tasks:
         due = ""
         if t.get("due"):
@@ -33,8 +33,35 @@ def format_tasks(tasks) -> str:
     return "\n".join(lines)
 
 
-def get_active_tasks():
-    # Новый API: фильтр передаётся в отдельный endpoint /tasks/filter
+def get_all_tasks():
+    # Новый API отдаёт результат постранично (cursor), собираем все страницы.
+    all_tasks = []
+    cursor = None
+
+    while True:
+        params = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+
+        response = httpx.get(
+            f"{TODOIST_API_BASE}/tasks",
+            headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+            params=params,
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        all_tasks.extend(data.get("results", []))
+        cursor = data.get("next_cursor")
+        if not cursor:
+            break
+
+    return all_tasks
+
+
+def get_today_tasks():
+    # Отдельный endpoint для фильтров: сегодня + просроченные
     response = httpx.get(
         f"{TODOIST_API_BASE}/tasks/filter",
         headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
@@ -42,25 +69,49 @@ def get_active_tasks():
         timeout=15,
     )
     response.raise_for_status()
-    data = response.json()
-    # Ответ пагинированный: список задач лежит в "results"
-    return data.get("results", [])
+    return response.json().get("results", [])
+
+
+def get_backlog_tasks():
+    # Задачи без даты выполнения — фильтруем локально из полного списка
+    tasks = get_all_tasks()
+    return [t for t in tasks if not t.get("due")]
 
 
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        tasks = get_active_tasks()
-        text = format_tasks(tasks)
+        tasks = get_all_tasks()
+        text = format_tasks(tasks, title="Все активные задачи:")
     except Exception as e:
         logger.exception("Ошибка при получении задач")
         text = f"Не смогла получить задачи: {e}"
     await update.message.reply_text(text)
 
 
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        tasks = get_today_tasks()
+        text = format_tasks(tasks, title="Сегодня и просрочено:")
+    except Exception as e:
+        logger.exception("Ошибка при получении задач на сегодня")
+        text = f"Не смогла получить задачи: {e}"
+    await update.message.reply_text(text)
+
+
+async def backlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        tasks = get_backlog_tasks()
+        text = format_tasks(tasks, title="Задачи без даты (беклог):")
+    except Exception as e:
+        logger.exception("Ошибка при получении беклога")
+        text = f"Не смогла получить задачи: {e}"
+    await update.message.reply_text(text)
+
+
 async def send_daily_summary(app: Application):
     try:
-        tasks = get_active_tasks()
-        text = format_tasks(tasks)
+        tasks = get_today_tasks()
+        text = format_tasks(tasks, title="Сегодня и просрочено:")
     except Exception as e:
         logger.exception("Ошибка при получении задач для рассылки")
         text = f"Не смогла получить задачи: {e}"
@@ -69,8 +120,11 @@ async def send_daily_summary(app: Application):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет. Команда /tasks покажет текущие задачи из Todoist.\n"
-        f"Ежедневная сводка приходит в {SEND_TIME} ({TIMEZONE})."
+        "Привет. Команды:\n"
+        "/today — задачи на сегодня и просроченные\n"
+        "/backlog — задачи без даты\n"
+        "/tasks — вообще все активные задачи\n\n"
+        f"Ежедневная сводка (сегодня + просрочено) приходит в {SEND_TIME} ({TIMEZONE})."
     )
 
 
@@ -79,6 +133,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("tasks", tasks_command))
+    app.add_handler(CommandHandler("today", today_command))
+    app.add_handler(CommandHandler("backlog", backlog_command))
 
     hour, minute = map(int, SEND_TIME.split(":"))
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
