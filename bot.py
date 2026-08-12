@@ -56,6 +56,41 @@ def get_project_emoji(project_name: str, fallback_index: int) -> str:
     return FALLBACK_EMOJIS[fallback_index % len(FALLBACK_EMOJIS)]
 
 
+def format_urgent_section(tasks) -> str:
+    if not tasks:
+        return ""
+
+    def format_due(due_info) -> str:
+        if not due_info:
+            return ""
+        raw = due_info.get("date", "")
+        if "T" in raw:
+            date_part, time_part = raw.split("T")
+            return f" (до {date_part} {time_part[:5]})"
+        return f" (до {raw})"
+
+    lines = ["🔥 Срочно на сегодня:\n"]
+    for t in tasks:
+        lines.append(f"• {t['content']}{format_due(t.get('due'))}")
+    return "\n".join(lines)
+
+
+def build_full_report() -> str:
+    urgent = get_today_tasks()
+    urgent_ids = {t["id"] for t in urgent}
+
+    all_tasks = get_all_tasks()
+    rest = [t for t in all_tasks if t["id"] not in urgent_ids]
+
+    parts = []
+    urgent_text = format_urgent_section(urgent)
+    if urgent_text:
+        parts.append(urgent_text)
+
+    parts.append(format_tasks(rest, title="Остальные задачи:"))
+    return "\n\n".join(parts)
+
+
 def format_tasks(tasks, title="Задачи:") -> str:
     if not tasks:
         return "Задач нет. Можно выдохнуть."
@@ -135,8 +170,7 @@ def get_backlog_tasks():
 
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        tasks = get_all_tasks()
-        text = format_tasks(tasks, title="Все активные задачи:")
+        text = build_full_report()
     except Exception as e:
         logger.exception("Ошибка при получении задач")
         text = f"Не смогла получить задачи: {e}"
