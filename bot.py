@@ -1,11 +1,10 @@
 import os
 import logging
-from datetime import datetime
 
+import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from todoist_api_python.api import TodoistAPI
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,7 +16,8 @@ CHAT_ID = int(os.environ["CHAT_ID"])
 SEND_TIME = os.environ.get("SEND_TIME", "08:00")
 TIMEZONE = os.environ.get("TIMEZONE", "Europe/Belgrade")
 
-todoist = TodoistAPI(TODOIST_TOKEN)
+# Актуальный (2026) единый Todoist API. Старый rest/v2 отключён (410 Gone).
+TODOIST_API_BASE = "https://api.todoist.com/api/v1"
 
 
 def format_tasks(tasks) -> str:
@@ -27,17 +27,24 @@ def format_tasks(tasks) -> str:
     lines = ["Задачи на сегодня:\n"]
     for t in tasks:
         due = ""
-        if t.due:
-            due = f" (до {t.due.date})"
-        lines.append(f"• {t.content}{due}")
+        if t.get("due"):
+            due = f" (до {t['due'].get('date', '')})"
+        lines.append(f"• {t['content']}{due}")
     return "\n".join(lines)
 
 
 def get_active_tasks():
-    # Берём все активные задачи. Если нужно только "на сегодня" —
-    # можно заменить на filter="today | overdue"
-    tasks = todoist.get_tasks(filter="today | overdue")
-    return tasks
+    # Новый API: фильтр передаётся в отдельный endpoint /tasks/filter
+    response = httpx.get(
+        f"{TODOIST_API_BASE}/tasks/filter",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        params={"query": "today | overdue"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    # Ответ пагинированный: список задач лежит в "results"
+    return data.get("results", [])
 
 
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
