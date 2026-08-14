@@ -40,12 +40,6 @@ WHOOP_CLIENT_ID = os.environ.get("WHOOP_CLIENT_ID")
 WHOOP_CLIENT_SECRET = os.environ.get("WHOOP_CLIENT_SECRET")
 WHOOP_REFRESH_TOKEN = os.environ.get("WHOOP_REFRESH_TOKEN")
 WHOOP_ENABLED = bool(WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET and WHOOP_REFRESH_TOKEN)
-logger.info(
-    f"WHOOP debug: CLIENT_ID={'есть' if WHOOP_CLIENT_ID else 'ПУСТО'}, "
-    f"CLIENT_SECRET={'есть' if WHOOP_CLIENT_SECRET else 'ПУСТО'}, "
-    f"REFRESH_TOKEN={'есть' if WHOOP_REFRESH_TOKEN else 'ПУСТО'}, "
-    f"ENABLED={WHOOP_ENABLED}"
-)
 
 
 def get_whoop_access_token() -> str:
@@ -73,33 +67,88 @@ def get_whoop_summary() -> str:
 
     lines = ["💪 WHOOP:\n"]
 
-    # Recovery — самая свежая запись
+    recovery_pct = None
+    sleep_performance = None
+    yesterday_strain = None
+
+    # Recovery — берём историю за ~месяц: одна запись для сегодня + остальные для расчёта личной нормы
     try:
         r = httpx.get(
             "https://api.prod.whoop.com/developer/v2/recovery",
             headers=headers,
-            params={"limit": 1},
+            params={"limit": 30},
             timeout=15,
         )
         r.raise_for_status()
         records = r.json().get("records", [])
-        if records and records[0].get("score_state") == "SCORED":
-            score = records[0]["score"]
-            lines.append(f"Recovery: {score['recovery_score']}%")
-            lines.append(f"Пульс покоя: {score['resting_heart_rate']} уд/мин")
-            lines.append(f"HRV: {round(score['hrv_rmssd_milli'])} мс")
+        scored = [rec for rec in records if rec.get("score_state") == "SCORED"]
+
+        if scored:
+            score = scored[0]["score"]
+            recovery_pct = score["recovery_score"]
+            # Пороги те же, что использует сам WHOOP (зелёный/жёлтый/красный)
+            if recovery_pct >= 67:
+                recovery_label = "хорошее 💚"
+            elif recovery_pct >= 34:
+                recovery_label = "среднее 💛"
+            else:
+                recovery_label = "низкое ❤️❗ — стоит отдохнуть"
+
+            prev = scored[1] if len(scored) > 1 else None
+            compare = ""
+            if prev:
+                delta = round(recovery_pct - prev["score"]["recovery_score"], 1)
+                if delta > 0:
+                    compare = f" (+{delta} к прошлому разу)"
+                elif delta < 0:
+                    compare = f" ({delta} к прошлому разу)"
+                else:
+                    compare = " (как и в прошлый раз)"
+
+            lines.append(f"Recovery: {recovery_pct}% — {recovery_label}{compare}")
+
+            rhr = score["resting_heart_rate"]
+            hrv = round(score["hrv_rmssd_milli"])
+
+            # Личная норма — среднее по всем предыдущим записям (не считая сегодняшнюю)
+            history = scored[1:]
+            baseline_note_rhr = ""
+            baseline_note_hrv = ""
+            if len(history) >= 5:
+                avg_rhr = sum(h["score"]["resting_heart_rate"] for h in history) / len(history)
+                avg_hrv = sum(h["score"]["hrv_rmssd_milli"] for h in history) / len(history)
+
+                rhr_diff_pct = (rhr - avg_rhr) / avg_rhr * 100
+                hrv_diff_pct = (hrv - avg_hrv) / avg_hrv * 100
+
+                if rhr_diff_pct > 8:
+                    baseline_note_rhr = f" (твой обычный ~{round(avg_rhr)}, сегодня выше — тревожный сигнал)"
+                elif rhr_diff_pct < -8:
+                    baseline_note_rhr = f" (твой обычный ~{round(avg_rhr)}, сегодня ниже — хорошо)"
+                else:
+                    baseline_note_rhr = f" (твой обычный ~{round(avg_rhr)}, в норме)"
+
+                if hrv_diff_pct > 8:
+                    baseline_note_hrv = f" (твой обычный ~{round(avg_hrv)}, сегодня выше — хорошо)"
+                elif hrv_diff_pct < -8:
+                    baseline_note_hrv = f" (твой обычный ~{round(avg_hrv)}, сегодня ниже — тревожный сигнал)"
+                else:
+                    baseline_note_hrv = f" (твой обычный ~{round(avg_hrv)}, в норме)"
+
+            lines.append(f"Пульс покоя: {rhr} уд/мин{baseline_note_rhr}")
+            lines.append(f"HRV: {hrv} мс{baseline_note_hrv}")
         else:
             lines.append("Recovery: пока не подсчитан.")
     except Exception:
         logger.exception("Ошибка при получении WHOOP recovery")
         lines.append("Recovery: не удалось получить.")
 
-    # Сон — самая свежая запись
+    # Сон — берём 2 последние записи для сравнения
     try:
         s = httpx.get(
             "https://api.prod.whoop.com/developer/v2/activity/sleep",
             headers=headers,
-            params={"limit": 1},
+            params={"limit": 2},
             timeout=15,
         )
         s.raise_for_status()
@@ -113,8 +162,29 @@ def get_whoop_summary() -> str:
             )
             hours = total_ms // 3600000
             minutes = (total_ms % 3600000) // 60000
-            performance = records[0]["score"].get("sleep_performance_percentage")
-            lines.append(f"Сон: {hours}ч {minutes}м (производительность {performance}%)")
+            sleep_performance = records[0]["score"].get("sleep_performance_percentage")
+            if sleep_performance is not None and sleep_performance >= 85:
+                sleep_label = "выспалась 💚"
+            elif sleep_performance is not None and sleep_performance >= 70:
+                sleep_label = "нормально 💛"
+            else:
+                sleep_label = "маловато ❤️❗"
+
+            compare = ""
+            if len(records) > 1 and records[1].get("score_state") == "SCORED":
+                prev_stage = records[1]["score"]["stage_summary"]
+                prev_total_ms = (
+                    prev_stage["total_light_sleep_time_milli"]
+                    + prev_stage["total_slow_wave_sleep_time_milli"]
+                    + prev_stage["total_rem_sleep_time_milli"]
+                )
+                delta_minutes = (total_ms - prev_total_ms) // 60000
+                if delta_minutes > 5:
+                    compare = f" (на {delta_minutes} мин больше, чем в прошлый раз)"
+                elif delta_minutes < -5:
+                    compare = f" (на {abs(delta_minutes)} мин меньше, чем в прошлый раз)"
+
+            lines.append(f"Сон: {hours}ч {minutes}м — {sleep_label} (производительность {sleep_performance}%){compare}")
         else:
             lines.append("Сон: пока не подсчитан.")
     except Exception:
@@ -134,10 +204,23 @@ def get_whoop_summary() -> str:
         # Первый цикл обычно "сегодняшний" (ещё идёт), второй — вчерашний завершённый
         yesterday_cycle = records[1] if len(records) > 1 else None
         if yesterday_cycle and yesterday_cycle.get("score_state") == "SCORED":
-            strain = yesterday_cycle["score"]["strain"]
-            lines.append(f"Вчерашний strain: {round(strain, 1)}")
+            yesterday_strain = yesterday_cycle["score"]["strain"]
+            # Шкала strain у WHOOP: 0-9 лёгкая нагрузка, 10-13 умеренная, 14-17 высокая, 18-21 максимальная
+            if yesterday_strain < 10:
+                strain_label = "лёгкий день"
+            elif yesterday_strain < 14:
+                strain_label = "умеренная нагрузка"
+            elif yesterday_strain < 18:
+                strain_label = "высокая нагрузка"
+            else:
+                strain_label = "максимальная нагрузка"
+            lines.append(f"Вчерашний strain: {round(yesterday_strain, 1)} — {strain_label}")
     except Exception:
         logger.exception("Ошибка при получении WHOOP цикла")
+
+    advice = get_whoop_advice(recovery_pct, sleep_performance, yesterday_strain)
+    if advice:
+        lines.append(f"\n💡 {advice}")
 
     return "\n".join(lines)
 
@@ -650,12 +733,28 @@ def get_whoop_mood_hint(recovery_score, sleep_performance) -> str:
     elif recovery_score >= 34:
         note = "немного уставшая, будь к ней бережнее сегодня 💛"
     else:
-        note = "организм просит отдыха — поддержи её и не грузи сегодня 🧡"
+        note = "организм просит отдыха — поддержи её и не грузи сегодня ❤️❗"
 
     if sleep_performance is not None and sleep_performance < 70:
         note += "\nСпала не очень хорошо, может быть более чувствительной."
 
     return note
+
+
+def get_whoop_advice(recovery_score, sleep_performance, yesterday_strain) -> str:
+    tips = []
+
+    if recovery_score is not None and recovery_score < 34:
+        tips.append("Стоит поспать днём и не планировать сегодня тяжёлую тренировку.")
+    elif recovery_score is not None and recovery_score >= 67 and (yesterday_strain is None or yesterday_strain < 14):
+        tips.append("Отличный день для тренировки, если хочется.")
+    elif recovery_score is not None:
+        tips.append("Сегодня лучше в спокойном темпе, без перегрузок.")
+
+    if sleep_performance is not None and sleep_performance < 70:
+        tips.append("Стоит лечь спать пораньше сегодня.")
+
+    return " ".join(tips)
 
 
 async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -671,7 +770,29 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for t in today_tasks:
             lines.append(f"• {t['content']}")
     else:
-        lines.append("Сегодня ничего не запланировано, можно просто обняться.")
+        lines.append("Задач на сегодня нет.")
+
+    # Встречи из календаря — просто плоский список, без деления по проектам/аккаунтам
+    if CALENDAR_ENABLED:
+        try:
+            calendars = get_today_calendar_events()
+            all_events = []
+            for _, events in calendars:
+                all_events.extend(events)
+            if all_events:
+                lines.append("\n🗓️ Встречи:")
+                for e in all_events:
+                    title = e.get("summary", "Без названия")
+                    start = e.get("start", {})
+                    time_str = ""
+                    if "dateTime" in start:
+                        time_str = start["dateTime"][11:16] + " — "
+                    lines.append(f"• {time_str}{title}")
+        except Exception:
+            logger.exception("Ошибка при получении календаря для Саши")
+
+    if not today_tasks and not (CALENDAR_ENABLED and any(e for _, e in get_today_calendar_events())):
+        lines.append("Можно просто написать ей тёплое сообщение.")
 
     if WHOOP_ENABLED:
         try:
@@ -682,6 +803,7 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sleep_performance = None
             sleep_hours = None
             sleep_minutes = None
+            yesterday_strain = None
 
             r = httpx.get(
                 "https://api.prod.whoop.com/developer/v2/recovery",
@@ -713,12 +835,28 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sleep_minutes = (total_ms % 3600000) // 60000
                 sleep_performance = sleep_records[0]["score"].get("sleep_performance_percentage")
 
+            c = httpx.get(
+                "https://api.prod.whoop.com/developer/v2/cycle",
+                headers=headers,
+                params={"limit": 2},
+                timeout=15,
+            )
+            c.raise_for_status()
+            cycle_records = c.json().get("records", [])
+            yesterday_cycle = cycle_records[1] if len(cycle_records) > 1 else None
+            if yesterday_cycle and yesterday_cycle.get("score_state") == "SCORED":
+                yesterday_strain = yesterday_cycle["score"]["strain"]
+
             if sleep_hours is not None:
                 lines.append(f"\n😴 Спала {sleep_hours}ч {sleep_minutes}м")
 
             mood_hint = get_whoop_mood_hint(recovery_score, sleep_performance)
             if mood_hint:
                 lines.append(f"\n{mood_hint}")
+
+            advice = get_whoop_advice(recovery_score, sleep_performance, yesterday_strain)
+            if advice:
+                lines.append(f"\n💡 {advice}")
         except Exception:
             logger.exception("Ошибка при получении WHOOP данных для Саши")
 
