@@ -19,6 +19,75 @@ TIMEZONE = os.environ.get("TIMEZONE", "Europe/Belgrade")
 # Актуальный (2026) единый Todoist API. Старый rest/v2 отключён (410 Gone).
 TODOIST_API_BASE = "https://api.todoist.com/api/v1"
 
+# Google Calendar — опционально. Если переменные не заданы, календарь просто не подключается.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
+CALENDAR_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN)
+
+
+def get_google_access_token() -> str:
+    # Refresh token не истекает сам, но обменивать его на access token
+    # нужно перед каждым запросом к API — access token живёт всего час.
+    response = httpx.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "refresh_token": GOOGLE_REFRESH_TOKEN,
+            "grant_type": "refresh_token",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+
+def get_today_calendar_events():
+    if not CALENDAR_ENABLED:
+        return []
+
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
+
+    access_token = get_google_access_token()
+    response = httpx.get(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={
+            "timeMin": start_of_day.isoformat(),
+            "timeMax": end_of_day.isoformat(),
+            "singleEvents": "true",
+            "orderBy": "startTime",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json().get("items", [])
+
+
+def format_calendar_section(events) -> str:
+    lines = ["🗓️ Встречи сегодня:\n"]
+    if not events:
+        lines.append("Встреч нет.")
+        return "\n".join(lines)
+
+    for e in events:
+        title = e.get("summary", "Без названия")
+        start = e.get("start", {})
+        # У событий на весь день нет времени, только dateTime
+        time_str = ""
+        if "dateTime" in start:
+            # Формат: 2026-08-15T14:00:00+03:00 — берём только часы:минуты
+            time_str = start["dateTime"][11:16] + " — "
+        lines.append(f"• {time_str}{title}")
+    return "\n".join(lines)
+
 
 def get_projects():
     # Название проектов нужно для группировки задач по разделам
@@ -277,11 +346,27 @@ def format_two_sections(today_tasks, overdue_tasks) -> str:
     return "\n".join(lines)
 
 
+async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not CALENDAR_ENABLED:
+        await update.message.reply_text("Календарь ещё не подключен.")
+        return
+    try:
+        events = get_today_calendar_events()
+        text = format_calendar_section(events)
+    except Exception as e:
+        logger.exception("Ошибка при получении событий календаря")
+        text = f"Не смогла получить события: {e}"
+    await update.message.reply_text(text)
+
+
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         today_tasks = get_today_only_tasks()
         overdue_tasks = get_overdue_tasks()
         text = format_two_sections(today_tasks, overdue_tasks)
+        if CALENDAR_ENABLED:
+            events = get_today_calendar_events()
+            text += "\n\n" + format_calendar_section(events)
     except Exception as e:
         logger.exception("Ошибка при получении задач на сегодня")
         text = f"Не смогла получить задачи: {e}"
@@ -303,6 +388,9 @@ async def send_daily_summary(app: Application):
         today_tasks = get_today_only_tasks()
         overdue_tasks = get_overdue_tasks()
         text = format_two_sections(today_tasks, overdue_tasks)
+        if CALENDAR_ENABLED:
+            events = get_today_calendar_events()
+            text += "\n\n" + format_calendar_section(events)
     except Exception as e:
         logger.exception("Ошибка при получении задач для рассылки")
         text = f"Не смогла получить задачи: {e}"
@@ -312,7 +400,7 @@ async def send_daily_summary(app: Application):
 MAIN_KEYBOARD_ROWS = [
     ["📅 Сегодня", "🗂️ Беклог"],
     ["📋 Все задачи", "➡️ Завтра"],
-    ["📆 Неделя"],
+    ["📆 Неделя", "🗓️ Календарь"],
     ["❤️ Для Саши"],
 ]
 
@@ -365,6 +453,8 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await tomorrow_command(update, context)
     elif text == "📆 Неделя":
         await week_command(update, context)
+    elif text == "🗓️ Календарь":
+        await calendar_command(update, context)
     elif text == "❤️ Для Саши":
         await for_sasha_handler(update, context)
     else:
@@ -380,6 +470,7 @@ def main():
     app.add_handler(CommandHandler("backlog", backlog_command))
     app.add_handler(CommandHandler("tomorrow", tomorrow_command))
     app.add_handler(CommandHandler("week", week_command))
+    app.add_handler(CommandHandler("calendar", calendar_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_button_handler))
 
     hour, minute = map(int, SEND_TIME.split(":"))
