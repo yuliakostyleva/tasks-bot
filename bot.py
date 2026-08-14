@@ -113,19 +113,15 @@ def format_calendar_section(calendars) -> str:
             time_str = start["dateTime"][11:16] + " — "
         return f"• {time_str}{title}"
 
-    any_events = False
     for label, events in calendars:
-        if not events:
-            continue
-        any_events = True
-        if label:
-            lines.append(f"[{label}]")
-        for e in events:
-            lines.append(format_event(e))
+        header = f"[{label}]" if label else "Основной"
+        lines.append(header)
+        if events:
+            for e in events:
+                lines.append(format_event(e))
+        else:
+            lines.append("Без встреч.")
         lines.append("")
-
-    if not any_events:
-        lines.append("Встреч нет.")
 
     return "\n".join(lines).strip()
 
