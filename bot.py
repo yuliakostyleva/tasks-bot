@@ -58,6 +58,12 @@ WHOOP_CLIENT_ID = os.environ.get("WHOOP_CLIENT_ID")
 WHOOP_CLIENT_SECRET = os.environ.get("WHOOP_CLIENT_SECRET")
 WHOOP_REFRESH_TOKEN = os.environ.get("WHOOP_REFRESH_TOKEN")
 WHOOP_ENABLED = bool(WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET and WHOOP_REFRESH_TOKEN)
+logger.info(
+    f"WHOOP debug 2: CLIENT_ID_len={len(WHOOP_CLIENT_ID) if WHOOP_CLIENT_ID else 0}, "
+    f"CLIENT_SECRET_len={len(WHOOP_CLIENT_SECRET) if WHOOP_CLIENT_SECRET else 0}, "
+    f"REFRESH_TOKEN_len={len(WHOOP_REFRESH_TOKEN) if WHOOP_REFRESH_TOKEN else 0}, "
+    f"ENABLED={WHOOP_ENABLED}"
+)
 
 # Чтобы новый (ротированный) refresh token не терялся при каждом передеплое,
 # бот сам записывает его обратно в переменные Railway через официальный API.
