@@ -36,7 +36,15 @@ EXTRA_CALENDARS = [
 CALENDAR_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN)
 
 
-def get_google_access_token(refresh_token: str) -> str:
+def list_google_calendars(refresh_token: str):
+    access_token = get_google_access_token(refresh_token)
+    response = httpx.get(
+        "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json().get("items", [])
     # Refresh token не истекает сам, но обменивать его на access token
     # нужно перед каждым запросом к API — access token живёт всего час.
     response = httpx.post(
@@ -383,6 +391,23 @@ def format_two_sections(today_tasks, overdue_tasks) -> str:
     return "\n".join(lines)
 
 
+async def listcalendars_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not CALENDAR_ENABLED:
+        await update.message.reply_text("Календарь ещё не подключен.")
+        return
+    try:
+        calendars = list_google_calendars(GOOGLE_REFRESH_TOKEN)
+    except Exception as e:
+        logger.exception("Ошибка при получении списка календарей")
+        await update.message.reply_text(f"Не смогла получить список: {e}")
+        return
+
+    lines = ["Твои календари в этом аккаунте:\n"]
+    for c in calendars:
+        lines.append(f"• {c.get('summary', 'Без названия')}\n  id: {c.get('id')}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not CALENDAR_ENABLED:
         await update.message.reply_text("Календарь ещё не подключен.")
@@ -508,6 +533,7 @@ def main():
     app.add_handler(CommandHandler("tomorrow", tomorrow_command))
     app.add_handler(CommandHandler("week", week_command))
     app.add_handler(CommandHandler("calendar", calendar_command))
+    app.add_handler(CommandHandler("listcalendars", listcalendars_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_button_handler))
 
     hour, minute = map(int, SEND_TIME.split(":"))
