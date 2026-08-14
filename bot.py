@@ -40,6 +40,12 @@ WHOOP_CLIENT_ID = os.environ.get("WHOOP_CLIENT_ID")
 WHOOP_CLIENT_SECRET = os.environ.get("WHOOP_CLIENT_SECRET")
 WHOOP_REFRESH_TOKEN = os.environ.get("WHOOP_REFRESH_TOKEN")
 WHOOP_ENABLED = bool(WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET and WHOOP_REFRESH_TOKEN)
+logger.info(
+    f"WHOOP debug: CLIENT_ID={'есть' if WHOOP_CLIENT_ID else 'ПУСТО'}, "
+    f"CLIENT_SECRET={'есть' if WHOOP_CLIENT_SECRET else 'ПУСТО'}, "
+    f"REFRESH_TOKEN={'есть' if WHOOP_REFRESH_TOKEN else 'ПУСТО'}, "
+    f"ENABLED={WHOOP_ENABLED}"
+)
 
 
 def get_whoop_access_token() -> str:
