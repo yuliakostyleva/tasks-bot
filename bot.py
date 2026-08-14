@@ -19,14 +19,24 @@ TIMEZONE = os.environ.get("TIMEZONE", "Europe/Belgrade")
 # Актуальный (2026) единый Todoist API. Старый rest/v2 отключён (410 Gone).
 TODOIST_API_BASE = "https://api.todoist.com/api/v1"
 
-# Google Calendar — опционально. Если переменные не заданы, календарь просто не подключается.
+# Google Calendar — опционально. Поддерживает несколько аккаунтов/календарей.
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+
+# Основной календарь (обязательно, если хочешь календарь вообще)
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
+
+# Дополнительные календари — каждый со своим refresh token и понятным названием.
+# Добавляй новые пары так же: NAME задаётся здесь в коде, TOKEN берётся из своей переменной в Railway.
+EXTRA_CALENDARS = [
+    {"label": "Simple", "refresh_token": os.environ.get("GOOGLE_REFRESH_TOKEN_SIMPLE")},
+    {"label": "Coach", "refresh_token": os.environ.get("GOOGLE_REFRESH_TOKEN_COACH")},
+]
+
 CALENDAR_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN)
 
 
-def get_google_access_token() -> str:
+def get_google_access_token(refresh_token: str) -> str:
     # Refresh token не истекает сам, но обменивать его на access token
     # нужно перед каждым запросом к API — access token живёт всего час.
     response = httpx.post(
@@ -34,7 +44,7 @@ def get_google_access_token() -> str:
         data={
             "client_id": GOOGLE_CLIENT_ID,
             "client_secret": GOOGLE_CLIENT_SECRET,
-            "refresh_token": GOOGLE_REFRESH_TOKEN,
+            "refresh_token": refresh_token,
             "grant_type": "refresh_token",
         },
         timeout=15,
@@ -43,10 +53,7 @@ def get_google_access_token() -> str:
     return response.json()["access_token"]
 
 
-def get_today_calendar_events():
-    if not CALENDAR_ENABLED:
-        return []
-
+def get_today_events_for_token(refresh_token: str):
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
@@ -55,7 +62,7 @@ def get_today_calendar_events():
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
 
-    access_token = get_google_access_token()
+    access_token = get_google_access_token(refresh_token)
     response = httpx.get(
         "https://www.googleapis.com/calendar/v3/calendars/primary/events",
         headers={"Authorization": f"Bearer {access_token}"},
@@ -71,22 +78,56 @@ def get_today_calendar_events():
     return response.json().get("items", [])
 
 
-def format_calendar_section(events) -> str:
-    lines = ["🗓️ Встречи сегодня:\n"]
-    if not events:
-        lines.append("Встреч нет.")
-        return "\n".join(lines)
+def get_today_calendar_events():
+    # Возвращает список (label, events) — label пустой для основного календаря
+    if not CALENDAR_ENABLED:
+        return []
 
-    for e in events:
+    results = []
+    try:
+        results.append(("", get_today_events_for_token(GOOGLE_REFRESH_TOKEN)))
+    except Exception:
+        logger.exception("Ошибка при получении основного календаря")
+
+    for cal in EXTRA_CALENDARS:
+        if not cal["refresh_token"]:
+            continue
+        try:
+            events = get_today_events_for_token(cal["refresh_token"])
+            results.append((cal["label"], events))
+        except Exception:
+            logger.exception(f"Ошибка при получении календаря {cal['label']}")
+
+    return results
+
+
+def format_calendar_section(calendars) -> str:
+    lines = ["🗓️ Встречи сегодня:\n"]
+
+    def format_event(e) -> str:
         title = e.get("summary", "Без названия")
         start = e.get("start", {})
-        # У событий на весь день нет времени, только dateTime
         time_str = ""
         if "dateTime" in start:
             # Формат: 2026-08-15T14:00:00+03:00 — берём только часы:минуты
             time_str = start["dateTime"][11:16] + " — "
-        lines.append(f"• {time_str}{title}")
-    return "\n".join(lines)
+        return f"• {time_str}{title}"
+
+    any_events = False
+    for label, events in calendars:
+        if not events:
+            continue
+        any_events = True
+        if label:
+            lines.append(f"[{label}]")
+        for e in events:
+            lines.append(format_event(e))
+        lines.append("")
+
+    if not any_events:
+        lines.append("Встреч нет.")
+
+    return "\n".join(lines).strip()
 
 
 def get_projects():
