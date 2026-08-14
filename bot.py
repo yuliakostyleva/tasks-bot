@@ -36,15 +36,7 @@ EXTRA_CALENDARS = [
 CALENDAR_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN)
 
 
-def list_google_calendars(refresh_token: str):
-    access_token = get_google_access_token(refresh_token)
-    response = httpx.get(
-        "https://www.googleapis.com/calendar/v3/users/me/calendarList",
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=15,
-    )
-    response.raise_for_status()
-    return response.json().get("items", [])
+def get_google_access_token(refresh_token: str) -> str:
     # Refresh token не истекает сам, но обменивать его на access token
     # нужно перед каждым запросом к API — access token живёт всего час.
     response = httpx.post(
@@ -59,6 +51,17 @@ def list_google_calendars(refresh_token: str):
     )
     response.raise_for_status()
     return response.json()["access_token"]
+
+
+def list_google_calendars(refresh_token: str):
+    access_token = get_google_access_token(refresh_token)
+    response = httpx.get(
+        "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json().get("items", [])
 
 
 def get_today_events_for_token(refresh_token: str):
