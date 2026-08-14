@@ -35,19 +35,53 @@ EXTRA_CALENDARS = [
 
 CALENDAR_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN)
 
+# Погода для отчёта Саше — через wttr.in, без ключей и регистрации.
+# Город можно сменить в Railway переменной WEATHER_CITY (например Belgrade, если понадобится).
+WEATHER_CITY = os.environ.get("WEATHER_CITY", "Saint Petersburg")
+
+
+def get_weather_summary() -> str:
+    try:
+        response = httpx.get(
+            f"https://wttr.in/{WEATHER_CITY.replace(' ', '+')}",
+            params={"format": "3", "lang": "ru"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.text.strip()
+    except Exception:
+        logger.exception("Ошибка при получении погоды")
+        return ""
+
 # WHOOP — опционально. Recovery, сон, активность.
 WHOOP_CLIENT_ID = os.environ.get("WHOOP_CLIENT_ID")
 WHOOP_CLIENT_SECRET = os.environ.get("WHOOP_CLIENT_SECRET")
 WHOOP_REFRESH_TOKEN = os.environ.get("WHOOP_REFRESH_TOKEN")
 WHOOP_ENABLED = bool(WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET and WHOOP_REFRESH_TOKEN)
 
+# WHOOP выдаёт НОВЫЙ refresh token при каждом обновлении access token и сразу
+# гасит старый. Поэтому храним актуальную пару токенов в памяти процесса,
+# а не берём каждый раз статичное значение из переменной окружения.
+_whoop_token_cache = {
+    "access_token": None,
+    "refresh_token": WHOOP_REFRESH_TOKEN,
+    "expires_at": 0,
+}
+
 
 def get_whoop_access_token() -> str:
+    import time
+
+    now = time.time()
+    # Если есть свежий (не истёкший) access token — используем его без лишнего похода в WHOOP
+    if _whoop_token_cache["access_token"] and now < _whoop_token_cache["expires_at"] - 300:
+        return _whoop_token_cache["access_token"]
+
     response = httpx.post(
         "https://api.prod.whoop.com/oauth/oauth2/token",
         data={
             "grant_type": "refresh_token",
-            "refresh_token": WHOOP_REFRESH_TOKEN,
+            "refresh_token": _whoop_token_cache["refresh_token"],
             "client_id": WHOOP_CLIENT_ID,
             "client_secret": WHOOP_CLIENT_SECRET,
             "scope": "offline",
@@ -55,7 +89,14 @@ def get_whoop_access_token() -> str:
         timeout=15,
     )
     response.raise_for_status()
-    return response.json()["access_token"]
+    data = response.json()
+
+    _whoop_token_cache["access_token"] = data["access_token"]
+    # Важно: сохраняем НОВЫЙ refresh token, иначе следующий вызов снова упадёт
+    _whoop_token_cache["refresh_token"] = data.get("refresh_token", _whoop_token_cache["refresh_token"])
+    _whoop_token_cache["expires_at"] = now + data.get("expires_in", 3600)
+
+    return _whoop_token_cache["access_token"]
 
 
 def get_whoop_summary() -> str:
@@ -137,6 +178,28 @@ def get_whoop_summary() -> str:
 
             lines.append(f"Пульс покоя: {rhr} уд/мин{baseline_note_rhr}")
             lines.append(f"HRV: {hrv} мс{baseline_note_hrv}")
+
+            # Связываем recovery с тем, что реально на него влияет — HRV и пульс покоя
+            if len(history) >= 5:
+                hrv_low = hrv_diff_pct < -8
+                rhr_high = rhr_diff_pct > 8
+                hrv_high = hrv_diff_pct > 8
+                rhr_low = rhr_diff_pct < -8
+
+                if recovery_pct < 67 and (hrv_low or rhr_high):
+                    causes = []
+                    if hrv_low:
+                        causes.append("HRV ниже обычного")
+                    if rhr_high:
+                        causes.append("пульс покоя выше обычного")
+                    lines.append(f"📊 Recovery снижен — {', '.join(causes)}.")
+                elif recovery_pct >= 67 and (hrv_high or rhr_low):
+                    causes = []
+                    if hrv_high:
+                        causes.append("HRV выше обычного")
+                    if rhr_low:
+                        causes.append("пульс покоя ниже обычного")
+                    lines.append(f"📊 Recovery хороший — {', '.join(causes)}.")
         else:
             lines.append("Recovery: пока не подсчитан.")
     except Exception:
@@ -766,6 +829,11 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = ["❤️ Сегодня у Юлечки такие вот дела:\n"]
+
+    weather = get_weather_summary()
+    if weather:
+        lines.append(f"📍 {weather}\n")
+
     if today_tasks:
         for t in today_tasks:
             lines.append(f"• {t['content']}")
