@@ -59,6 +59,48 @@ WHOOP_CLIENT_SECRET = os.environ.get("WHOOP_CLIENT_SECRET")
 WHOOP_REFRESH_TOKEN = os.environ.get("WHOOP_REFRESH_TOKEN")
 WHOOP_ENABLED = bool(WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET and WHOOP_REFRESH_TOKEN)
 
+# Чтобы новый (ротированный) refresh token не терялся при каждом передеплое,
+# бот сам записывает его обратно в переменные Railway через официальный API.
+RAILWAY_API_TOKEN = os.environ.get("RAILWAY_API_TOKEN")
+# Эти три ID Railway подставляет сам, вручную их вписывать не нужно
+RAILWAY_PROJECT_ID = os.environ.get("RAILWAY_PROJECT_ID")
+RAILWAY_ENVIRONMENT_ID = os.environ.get("RAILWAY_ENVIRONMENT_ID")
+RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID")
+
+
+def persist_whoop_refresh_token(new_token: str):
+    if not RAILWAY_API_TOKEN:
+        return  # не настроено — просто не сохраняем, бот продолжит работать в памяти
+
+    try:
+        httpx.post(
+            "https://backboard.railway.com/graphql/v2",
+            headers={"Authorization": f"Bearer {RAILWAY_API_TOKEN}"},
+            json={
+                "query": """
+                    mutation UpdateWhoopToken($projectId: String!, $environmentId: String!, $serviceId: String!, $value: String!) {
+                        variableUpsert(input: {
+                            projectId: $projectId,
+                            environmentId: $environmentId,
+                            serviceId: $serviceId,
+                            name: "WHOOP_REFRESH_TOKEN",
+                            value: $value,
+                            skipDeploys: true
+                        })
+                    }
+                """,
+                "variables": {
+                    "projectId": RAILWAY_PROJECT_ID,
+                    "environmentId": RAILWAY_ENVIRONMENT_ID,
+                    "serviceId": RAILWAY_SERVICE_ID,
+                    "value": new_token,
+                },
+            },
+            timeout=10,
+        )
+    except Exception:
+        logger.exception("Не удалось сохранить обновлённый WHOOP refresh token в Railway")
+
 # WHOOP выдаёт НОВЫЙ refresh token при каждом обновлении access token и сразу
 # гасит старый. Поэтому храним актуальную пару токенов в памяти процесса,
 # а не берём каждый раз статичное значение из переменной окружения.
@@ -92,8 +134,11 @@ def get_whoop_access_token() -> str:
     data = response.json()
 
     _whoop_token_cache["access_token"] = data["access_token"]
+    new_refresh_token = data.get("refresh_token")
     # Важно: сохраняем НОВЫЙ refresh token, иначе следующий вызов снова упадёт
-    _whoop_token_cache["refresh_token"] = data.get("refresh_token", _whoop_token_cache["refresh_token"])
+    if new_refresh_token and new_refresh_token != _whoop_token_cache["refresh_token"]:
+        _whoop_token_cache["refresh_token"] = new_refresh_token
+        persist_whoop_refresh_token(new_refresh_token)
     _whoop_token_cache["expires_at"] = now + data.get("expires_in", 3600)
 
     return _whoop_token_cache["access_token"]
