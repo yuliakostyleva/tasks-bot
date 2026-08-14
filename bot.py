@@ -35,6 +35,106 @@ EXTRA_CALENDARS = [
 
 CALENDAR_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN)
 
+# WHOOP — опционально. Recovery, сон, активность.
+WHOOP_CLIENT_ID = os.environ.get("WHOOP_CLIENT_ID")
+WHOOP_CLIENT_SECRET = os.environ.get("WHOOP_CLIENT_SECRET")
+WHOOP_REFRESH_TOKEN = os.environ.get("WHOOP_REFRESH_TOKEN")
+WHOOP_ENABLED = bool(WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET and WHOOP_REFRESH_TOKEN)
+
+
+def get_whoop_access_token() -> str:
+    response = httpx.post(
+        "https://api.prod.whoop.com/oauth/oauth2/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": WHOOP_REFRESH_TOKEN,
+            "client_id": WHOOP_CLIENT_ID,
+            "client_secret": WHOOP_CLIENT_SECRET,
+            "scope": "offline",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+
+def get_whoop_summary() -> str:
+    if not WHOOP_ENABLED:
+        return ""
+
+    access_token = get_whoop_access_token()
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    lines = ["💪 WHOOP:\n"]
+
+    # Recovery — самая свежая запись
+    try:
+        r = httpx.get(
+            "https://api.prod.whoop.com/developer/v2/recovery",
+            headers=headers,
+            params={"limit": 1},
+            timeout=15,
+        )
+        r.raise_for_status()
+        records = r.json().get("records", [])
+        if records and records[0].get("score_state") == "SCORED":
+            score = records[0]["score"]
+            lines.append(f"Recovery: {score['recovery_score']}%")
+            lines.append(f"Пульс покоя: {score['resting_heart_rate']} уд/мин")
+            lines.append(f"HRV: {round(score['hrv_rmssd_milli'])} мс")
+        else:
+            lines.append("Recovery: пока не подсчитан.")
+    except Exception:
+        logger.exception("Ошибка при получении WHOOP recovery")
+        lines.append("Recovery: не удалось получить.")
+
+    # Сон — самая свежая запись
+    try:
+        s = httpx.get(
+            "https://api.prod.whoop.com/developer/v2/activity/sleep",
+            headers=headers,
+            params={"limit": 1},
+            timeout=15,
+        )
+        s.raise_for_status()
+        records = s.json().get("records", [])
+        if records and records[0].get("score_state") == "SCORED":
+            stage = records[0]["score"]["stage_summary"]
+            total_ms = (
+                stage["total_light_sleep_time_milli"]
+                + stage["total_slow_wave_sleep_time_milli"]
+                + stage["total_rem_sleep_time_milli"]
+            )
+            hours = total_ms // 3600000
+            minutes = (total_ms % 3600000) // 60000
+            performance = records[0]["score"].get("sleep_performance_percentage")
+            lines.append(f"Сон: {hours}ч {minutes}м (производительность {performance}%)")
+        else:
+            lines.append("Сон: пока не подсчитан.")
+    except Exception:
+        logger.exception("Ошибка при получении WHOOP сна")
+        lines.append("Сон: не удалось получить.")
+
+    # Активность за вчера — берём последние 2 цикла, второй обычно завершённый (вчерашний)
+    try:
+        c = httpx.get(
+            "https://api.prod.whoop.com/developer/v2/cycle",
+            headers=headers,
+            params={"limit": 2},
+            timeout=15,
+        )
+        c.raise_for_status()
+        records = c.json().get("records", [])
+        # Первый цикл обычно "сегодняшний" (ещё идёт), второй — вчерашний завершённый
+        yesterday_cycle = records[1] if len(records) > 1 else None
+        if yesterday_cycle and yesterday_cycle.get("score_state") == "SCORED":
+            strain = yesterday_cycle["score"]["strain"]
+            lines.append(f"Вчерашний strain: {round(strain, 1)}")
+    except Exception:
+        logger.exception("Ошибка при получении WHOOP цикла")
+
+    return "\n".join(lines)
+
 
 def get_google_access_token(refresh_token: str) -> str:
     # Refresh token не истекает сам, но обменивать его на access token
@@ -442,6 +542,18 @@ async def listcalendars_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("\n".join(lines))
 
 
+async def whoop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not WHOOP_ENABLED:
+        await update.message.reply_text("WHOOP ещё не подключен.")
+        return
+    try:
+        text = get_whoop_summary()
+    except Exception as e:
+        logger.exception("Ошибка при получении WHOOP сводки")
+        text = f"Не смогла получить данные WHOOP: {e}"
+    await update.message.reply_text(text)
+
+
 async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not CALENDAR_ENABLED:
         await update.message.reply_text("Календарь ещё не подключен.")
@@ -463,6 +575,8 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if CALENDAR_ENABLED:
             events = get_today_calendar_events()
             text += "\n\n" + format_calendar_section(events)
+        if WHOOP_ENABLED:
+            text += "\n\n" + get_whoop_summary()
     except Exception as e:
         logger.exception("Ошибка при получении задач на сегодня")
         text = f"Не смогла получить задачи: {e}"
@@ -487,6 +601,8 @@ async def send_daily_summary(app: Application):
         if CALENDAR_ENABLED:
             events = get_today_calendar_events()
             text += "\n\n" + format_calendar_section(events)
+        if WHOOP_ENABLED:
+            text += "\n\n" + get_whoop_summary()
     except Exception as e:
         logger.exception("Ошибка при получении задач для рассылки")
         text = f"Не смогла получить задачи: {e}"
@@ -497,6 +613,7 @@ MAIN_KEYBOARD_ROWS = [
     ["📅 Сегодня", "🗂️ Беклог"],
     ["📋 Все задачи", "➡️ Завтра"],
     ["📆 Неделя", "🗓️ Календарь"],
+    ["💪 WHOOP"],
     ["❤️ Для Саши"],
 ]
 
@@ -517,6 +634,24 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def get_whoop_mood_hint(recovery_score, sleep_performance) -> str:
+    # Мягкая, не медицинская интерпретация — просто чтобы Саша понимал, как аккуратнее быть
+    if recovery_score is None:
+        return ""
+
+    if recovery_score >= 67:
+        note = "чувствует себя бодро, всё в порядке 💚"
+    elif recovery_score >= 34:
+        note = "немного уставшая, будь к ней бережнее сегодня 💛"
+    else:
+        note = "организм просит отдыха — поддержи её и не грузи сегодня 🧡"
+
+    if sleep_performance is not None and sleep_performance < 70:
+        note += "\nСпала не очень хорошо, может быть более чувствительной."
+
+    return note
+
+
 async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         today_tasks = get_today_only_tasks()
@@ -531,6 +666,56 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"• {t['content']}")
     else:
         lines.append("Сегодня ничего не запланировано, можно просто обняться.")
+
+    if WHOOP_ENABLED:
+        try:
+            access_token = get_whoop_access_token()
+            headers = {"Authorization": f"Bearer {access_token}"}
+
+            recovery_score = None
+            sleep_performance = None
+            sleep_hours = None
+            sleep_minutes = None
+
+            r = httpx.get(
+                "https://api.prod.whoop.com/developer/v2/recovery",
+                headers=headers,
+                params={"limit": 1},
+                timeout=15,
+            )
+            r.raise_for_status()
+            records = r.json().get("records", [])
+            if records and records[0].get("score_state") == "SCORED":
+                recovery_score = records[0]["score"]["recovery_score"]
+
+            s = httpx.get(
+                "https://api.prod.whoop.com/developer/v2/activity/sleep",
+                headers=headers,
+                params={"limit": 1},
+                timeout=15,
+            )
+            s.raise_for_status()
+            sleep_records = s.json().get("records", [])
+            if sleep_records and sleep_records[0].get("score_state") == "SCORED":
+                stage = sleep_records[0]["score"]["stage_summary"]
+                total_ms = (
+                    stage["total_light_sleep_time_milli"]
+                    + stage["total_slow_wave_sleep_time_milli"]
+                    + stage["total_rem_sleep_time_milli"]
+                )
+                sleep_hours = total_ms // 3600000
+                sleep_minutes = (total_ms % 3600000) // 60000
+                sleep_performance = sleep_records[0]["score"].get("sleep_performance_percentage")
+
+            if sleep_hours is not None:
+                lines.append(f"\n😴 Спала {sleep_hours}ч {sleep_minutes}м")
+
+            mood_hint = get_whoop_mood_hint(recovery_score, sleep_performance)
+            if mood_hint:
+                lines.append(f"\n{mood_hint}")
+        except Exception:
+            logger.exception("Ошибка при получении WHOOP данных для Саши")
+
     text = "\n".join(lines)
 
     # Присылаем ей самой — дальше она пересылает это сообщение Саше вручную
@@ -551,6 +736,8 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await week_command(update, context)
     elif text == "🗓️ Календарь":
         await calendar_command(update, context)
+    elif text == "💪 WHOOP":
+        await whoop_command(update, context)
     elif text == "❤️ Для Саши":
         await for_sasha_handler(update, context)
     else:
@@ -568,6 +755,7 @@ def main():
     app.add_handler(CommandHandler("week", week_command))
     app.add_handler(CommandHandler("calendar", calendar_command))
     app.add_handler(CommandHandler("listcalendars", listcalendars_command))
+    app.add_handler(CommandHandler("whoop", whoop_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_button_handler))
 
     hour, minute = map(int, SEND_TIME.split(":"))
