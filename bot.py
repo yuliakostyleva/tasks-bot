@@ -117,7 +117,7 @@ def get_whoop_summary() -> str:
         r = httpx.get(
             "https://api.prod.whoop.com/developer/v2/recovery",
             headers=headers,
-            params={"limit": 30},
+            params={"limit": 25},
             timeout=15,
         )
         r.raise_for_status()
