@@ -64,7 +64,7 @@ def list_google_calendars(refresh_token: str):
     return response.json().get("items", [])
 
 
-def get_today_events_for_token(refresh_token: str):
+def get_today_events_for_token(refresh_token: str, calendar_id: str = "primary"):
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
@@ -74,8 +74,12 @@ def get_today_events_for_token(refresh_token: str):
     end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
 
     access_token = get_google_access_token(refresh_token)
+    # ID календаря нужно закодировать для URL, т.к. там могут быть @ и другие спецсимволы
+    from urllib.parse import quote
+    encoded_id = quote(calendar_id, safe="")
+
     response = httpx.get(
-        "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+        f"https://www.googleapis.com/calendar/v3/calendars/{encoded_id}/events",
         headers={"Authorization": f"Bearer {access_token}"},
         params={
             "timeMin": start_of_day.isoformat(),
@@ -89,23 +93,39 @@ def get_today_events_for_token(refresh_token: str):
     return response.json().get("items", [])
 
 
+# Календари внутри личного аккаунта, которые нас интересуют (праздничные пропускаем)
+MAIN_ACCOUNT_CALENDARS = [
+    {"id": "primary", "label": "Основной"},
+    {"id": "t7iblka8tatqu1eh5lei2trh1o@group.calendar.google.com", "label": "🧘‍♀️ Sport"},
+    {"id": "abj57mm23d217iiks6ob2lc9o4@group.calendar.google.com", "label": "💞 Self Care"},
+    {"id": "jnk3uer5kha8tu014tf9bossos@group.calendar.google.com", "label": "👯 Встречи с друзьями"},
+    {"id": "0apnocv3q4lb3lvqgokc72kke4@group.calendar.google.com", "label": "✈️ Travel"},
+    {"id": "642dc43a7926e7a7fd079090b82a3aaa0ebdd285ee67b2ee01d9ec1ab94fd5a9@group.calendar.google.com", "label": "💸 Deposits"},
+    {"id": "de7100c3a9532829d193b591ea59caa68bd523ee186ebf252ffc858cc1e63b8e@group.calendar.google.com", "label": "🎂 ДР в Фридым"},
+    {"id": "f3f6c62cee4ba8909450e53cf6fdb2d063139a71459696de01420bb4f5a9486f@group.calendar.google.com", "label": "📋 TAX"},
+]
+
+
 def get_today_calendar_events():
-    # Возвращает список (label, events) — label пустой для основного календаря
+    # Возвращает список (label, events)
     if not CALENDAR_ENABLED:
         return []
 
     results = []
-    try:
-        results.append(("", get_today_events_for_token(GOOGLE_REFRESH_TOKEN)))
-    except Exception:
-        logger.exception("Ошибка при получении основного календаря")
+
+    for cal in MAIN_ACCOUNT_CALENDARS:
+        try:
+            events = get_today_events_for_token(GOOGLE_REFRESH_TOKEN, cal["id"])
+            results.append((cal["label"], events))
+        except Exception:
+            logger.exception(f"Ошибка при получении календаря {cal['label']}")
 
     for cal in EXTRA_CALENDARS:
         if not cal["refresh_token"]:
             continue
         try:
             events = get_today_events_for_token(cal["refresh_token"])
-            results.append((cal["label"], events))
+            results.append((f"[{cal['label']}]", events))
         except Exception:
             logger.exception(f"Ошибка при получении календаря {cal['label']}")
 
@@ -125,8 +145,7 @@ def format_calendar_section(calendars) -> str:
         return f"• {time_str}{title}"
 
     for label, events in calendars:
-        header = f"[{label}]" if label else "Основной"
-        lines.append(header)
+        lines.append(label)
         if events:
             for e in events:
                 lines.append(format_event(e))
