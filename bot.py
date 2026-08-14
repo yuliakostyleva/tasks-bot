@@ -107,7 +107,7 @@ MAIN_ACCOUNT_CALENDARS = [
 
 
 def get_today_calendar_events():
-    # Возвращает список (label, events)
+    # Возвращает список (label, events, is_work)
     if not CALENDAR_ENABLED:
         return []
 
@@ -116,7 +116,7 @@ def get_today_calendar_events():
     for cal in MAIN_ACCOUNT_CALENDARS:
         try:
             events = get_today_events_for_token(GOOGLE_REFRESH_TOKEN, cal["id"])
-            results.append((cal["label"], events))
+            results.append((cal["label"], events, False))
         except Exception:
             logger.exception(f"Ошибка при получении календаря {cal['label']}")
 
@@ -125,7 +125,7 @@ def get_today_calendar_events():
             continue
         try:
             events = get_today_events_for_token(cal["refresh_token"])
-            results.append((f"[{cal['label']}]", events))
+            results.append((f"[{cal['label']}]", events, True))
         except Exception:
             logger.exception(f"Ошибка при получении календаря {cal['label']}")
 
@@ -133,7 +133,11 @@ def get_today_calendar_events():
 
 
 def format_calendar_section(calendars) -> str:
-    lines = ["🗓️ Встречи сегодня:\n"]
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(TIMEZONE)
+    is_weekday = datetime.now(tz).weekday() < 5  # 0=понедельник ... 4=пятница
 
     def format_event(e) -> str:
         title = e.get("summary", "Без названия")
@@ -144,16 +148,24 @@ def format_calendar_section(calendars) -> str:
             time_str = start["dateTime"][11:16] + " — "
         return f"• {time_str}{title}"
 
-    for label, events in calendars:
-        lines.append(label)
+    lines = []
+    for label, events, is_work in calendars:
         if events:
+            lines.append(label)
             for e in events:
                 lines.append(format_event(e))
-        else:
-            lines.append("Без встреч.")
-        lines.append("")
+            lines.append("")
+        elif is_work and is_weekday:
+            # Рабочие календари по будням показываем всегда, даже пустые
+            lines.append(label)
+            lines.append("Нет встреч.")
+            lines.append("")
+        # Личные пустые календари (и рабочие в выходные) просто пропускаем
 
-    return "\n".join(lines).strip()
+    if not lines:
+        return "🗓️ Встречи сегодня:\n\nВстреч нет."
+
+    return "🗓️ Встречи сегодня:\n\n" + "\n".join(lines).strip()
 
 
 def get_projects():
