@@ -792,10 +792,19 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = f"{dym_status}\n\n{text}"
 
         if CALENDAR_ENABLED:
-            events = get_today_calendar_events()
-            text += "\n\n" + format_calendar_section(events)
+            try:
+                events = get_today_calendar_events()
+                text += "\n\n" + format_calendar_section(events)
+            except Exception:
+                logger.exception("Ошибка при получении календаря")
+                text += "\n\n🗓️ Календарь: не удалось получить."
+
         if WHOOP_ENABLED:
-            text += "\n\n" + get_whoop_summary()
+            try:
+                text += "\n\n" + get_whoop_summary()
+            except Exception:
+                logger.exception("Ошибка при получении WHOOP")
+                text += "\n\n💪 WHOOP: не удалось получить."
     except Exception as e:
         logger.exception("Ошибка при получении задач на сегодня")
         text = f"Не смогла получить задачи: {e}"
@@ -817,11 +826,25 @@ async def send_daily_summary(app: Application):
         today_tasks = get_today_only_tasks()
         overdue_tasks = get_overdue_tasks()
         text = format_two_sections(today_tasks, overdue_tasks)
+
+        dym_status = get_dym_status()
+        if dym_status:
+            text = f"{dym_status}\n\n{text}"
+
         if CALENDAR_ENABLED:
-            events = get_today_calendar_events()
-            text += "\n\n" + format_calendar_section(events)
+            try:
+                events = get_today_calendar_events()
+                text += "\n\n" + format_calendar_section(events)
+            except Exception:
+                logger.exception("Ошибка при получении календаря для рассылки")
+                text += "\n\n🗓️ Календарь: не удалось получить."
+
         if WHOOP_ENABLED:
-            text += "\n\n" + get_whoop_summary()
+            try:
+                text += "\n\n" + get_whoop_summary()
+            except Exception:
+                logger.exception("Ошибка при получении WHOOP для рассылки")
+                text += "\n\n💪 WHOOP: не удалось получить."
     except Exception as e:
         logger.exception("Ошибка при получении задач для рассылки")
         text = f"Не смогла получить задачи: {e}"
