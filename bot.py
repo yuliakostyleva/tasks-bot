@@ -70,6 +70,38 @@ def get_weather_summary() -> str:
         logger.exception("Ошибка при получении погоды")
         return ""
 
+
+def get_weather_forecast() -> str:
+    # Более подробный прогноз: сейчас + макс/мин на сегодня + краткое описание днём
+    try:
+        response = httpx.get(
+            f"https://wttr.in/{WEATHER_CITY.replace(' ', '+')}",
+            params={"format": "j1"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        current = data["current_condition"][0]
+        current_temp = current["temp_C"]
+        current_desc = current["lang_ru"][0]["value"] if current.get("lang_ru") else current["weatherDesc"][0]["value"]
+
+        today = data["weather"][0]
+        max_temp = today["maxtempC"]
+        min_temp = today["mintempC"]
+
+        # Берём описание погоды в середине дня (индекс 4 из 8 трёхчасовых интервалов ~ полдень)
+        midday = today["hourly"][4]
+        midday_desc = midday["lang_ru"][0]["value"] if midday.get("lang_ru") else midday["weatherDesc"][0]["value"]
+
+        return (
+            f"🌤️ Погода: сейчас {current_temp}°C, {current_desc.lower()}\n"
+            f"Днём {midday_desc.lower()}, от {min_temp}°C до {max_temp}°C"
+        )
+    except Exception:
+        logger.exception("Ошибка при получении прогноза погоды")
+        return ""
+
 # WHOOP — опционально. Recovery, сон, активность.
 WHOOP_CLIENT_ID = os.environ.get("WHOOP_CLIENT_ID")
 WHOOP_CLIENT_SECRET = os.environ.get("WHOOP_CLIENT_SECRET")
@@ -791,6 +823,10 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if dym_status:
             text = f"{dym_status}\n\n{text}"
 
+        weather = get_weather_forecast()
+        if weather:
+            text += "\n\n" + weather
+
         if CALENDAR_ENABLED:
             try:
                 events = get_today_calendar_events()
@@ -830,6 +866,10 @@ async def send_daily_summary(app: Application):
         dym_status = get_dym_status()
         if dym_status:
             text = f"{dym_status}\n\n{text}"
+
+        weather = get_weather_forecast()
+        if weather:
+            text += "\n\n" + weather
 
         if CALENDAR_ENABLED:
             try:
