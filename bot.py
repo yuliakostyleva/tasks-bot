@@ -58,12 +58,6 @@ WHOOP_CLIENT_ID = os.environ.get("WHOOP_CLIENT_ID")
 WHOOP_CLIENT_SECRET = os.environ.get("WHOOP_CLIENT_SECRET")
 WHOOP_REFRESH_TOKEN = os.environ.get("WHOOP_REFRESH_TOKEN")
 WHOOP_ENABLED = bool(WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET and WHOOP_REFRESH_TOKEN)
-logger.info(
-    f"WHOOP debug 2: CLIENT_ID_len={len(WHOOP_CLIENT_ID) if WHOOP_CLIENT_ID else 0}, "
-    f"CLIENT_SECRET_len={len(WHOOP_CLIENT_SECRET) if WHOOP_CLIENT_SECRET else 0}, "
-    f"REFRESH_TOKEN_len={len(WHOOP_REFRESH_TOKEN) if WHOOP_REFRESH_TOKEN else 0}, "
-    f"ENABLED={WHOOP_ENABLED}"
-)
 
 # Чтобы новый (ротированный) refresh token не терялся при каждом передеплое,
 # бот сам записывает его обратно в переменные Railway через официальный API.
@@ -892,10 +886,10 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("Задач на сегодня нет.")
 
     # Встречи из календаря — просто плоский список, без деления по проектам/аккаунтам
+    all_events = []
     if CALENDAR_ENABLED:
         try:
             calendars = get_today_calendar_events()
-            all_events = []
             for _, events in calendars:
                 all_events.extend(events)
             if all_events:
@@ -910,7 +904,7 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("Ошибка при получении календаря для Саши")
 
-    if not today_tasks and not (CALENDAR_ENABLED and any(e for _, e in get_today_calendar_events())):
+    if not today_tasks and not all_events:
         lines.append("Можно просто написать ей тёплое сообщение.")
 
     if WHOOP_ENABLED:
