@@ -39,6 +39,23 @@ CALENDAR_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REF
 # Город можно сменить в Railway переменной WEATHER_CITY (например Belgrade, если понадобится).
 WEATHER_CITY = os.environ.get("WEATHER_CITY", "Saint Petersburg")
 
+# Смены Ани во Фридыме — временная штука на пару недель (потом Дым закроется на ремонт).
+# Даты на август 2026, вписаны прямо тут. Когда актуальность пропадёт — удали эту переменную
+# и её использование в командах ниже.
+ANYA_SHIFT_DAYS = {1, 2, 4, 5, 8, 9, 10, 14, 16, 17, 18, 21, 23, 26, 29, 30}
+
+
+def get_dym_status() -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    today = datetime.now(ZoneInfo(TIMEZONE))
+
+    if today.day in ANYA_SHIFT_DAYS:
+        return "🟢💨 Благоприятный день, чтобы покурить в Дыме!"
+    else:
+        return "🔴 В Дыме Татьянин день! Лучше выбрать другое заведение для перекура."
+
 
 def get_weather_summary() -> str:
     try:
@@ -769,6 +786,11 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today_tasks = get_today_only_tasks()
         overdue_tasks = get_overdue_tasks()
         text = format_two_sections(today_tasks, overdue_tasks)
+
+        dym_status = get_dym_status()
+        if dym_status:
+            text = f"{dym_status}\n\n{text}"
+
         if CALENDAR_ENABLED:
             events = get_today_calendar_events()
             text += "\n\n" + format_calendar_section(events)
@@ -873,7 +895,13 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Не смогла получить задачи: {e}")
         return
 
-    lines = ["❤️ Сегодня у Юлечки такие вот дела:\n"]
+    lines = []
+
+    dym_status = get_dym_status()
+    if dym_status:
+        lines.append(f"{dym_status}\n")
+
+    lines.append("❤️ Сегодня у Юлечки такие вот дела:\n")
 
     weather = get_weather_summary()
     if weather:
