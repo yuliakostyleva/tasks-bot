@@ -1,3 +1,4 @@
 python-telegram-bot==21.6
 httpx
 APScheduler==3.10.4
+faster-whisper

@@ -1,5 +1,6 @@
 import os
 import logging
+import html
 
 import httpx
 from telegram import Update, ReplyKeyboardMarkup
@@ -95,7 +96,7 @@ def get_weather_forecast() -> str:
         midday_desc = midday["lang_ru"][0]["value"] if midday.get("lang_ru") else midday["weatherDesc"][0]["value"]
 
         return (
-            f"🌤️ Погода: сейчас {current_temp}°C, {current_desc.lower()}\n"
+            f"<b>🌤️ Погода:</b> сейчас {current_temp}°C, {current_desc.lower()}\n"
             f"Днём {midday_desc.lower()}, от {min_temp}°C до {max_temp}°C"
         )
     except Exception:
@@ -200,7 +201,7 @@ def get_whoop_summary() -> str:
     access_token = get_whoop_access_token()
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    lines = ["💪 WHOOP:\n"]
+    lines = ["<b>💪 WHOOP:</b>\n"]
 
     recovery_pct = None
     sleep_performance = None
@@ -486,7 +487,7 @@ def format_calendar_section(calendars) -> str:
     is_weekday = datetime.now(tz).weekday() < 5  # 0=понедельник ... 4=пятница
 
     def format_event(e) -> str:
-        title = e.get("summary", "Без названия")
+        title = html.escape(e.get("summary", "Без названия"))
         start = e.get("start", {})
         time_str = ""
         if "dateTime" in start:
@@ -497,21 +498,21 @@ def format_calendar_section(calendars) -> str:
     lines = []
     for label, events, is_work in calendars:
         if events:
-            lines.append(label)
+            lines.append(f"<b>{html.escape(label)}</b>")
             for e in events:
                 lines.append(format_event(e))
             lines.append("")
         elif is_work and is_weekday:
             # Рабочие календари по будням показываем всегда, даже пустые
-            lines.append(label)
+            lines.append(f"<b>{html.escape(label)}</b>")
             lines.append("Нет встреч.")
             lines.append("")
         # Личные пустые календари (и рабочие в выходные) просто пропускаем
 
     if not lines:
-        return "🗓️ Встречи сегодня:\n\nВстреч нет."
+        return "<b>🗓️ Встречи сегодня:</b>\n\nВстреч нет."
 
-    return "🗓️ Встречи сегодня:\n\n" + "\n".join(lines).strip()
+    return "<b>🗓️ Встречи сегодня:</b>\n\n" + "\n".join(lines).strip()
 
 
 def get_projects():
@@ -551,7 +552,7 @@ def get_project_emoji(project_name: str, fallback_index: int) -> str:
 
 
 def format_urgent_section(tasks) -> str:
-    lines = ["🔥 Срочно на сегодня:\n"]
+    lines = ["<b>🔥 Срочно на сегодня:</b>\n"]
     if not tasks:
         lines.append("Ничего горящего.")
         return "\n".join(lines)
@@ -566,7 +567,7 @@ def format_urgent_section(tasks) -> str:
         return f" (до {raw})"
 
     for t in tasks:
-        lines.append(f"• {t['content']}{format_due(t.get('due'))}")
+        lines.append(f"• {html.escape(t['content'])}{format_due(t.get('due'))}")
     return "\n".join(lines)
 
 
@@ -588,7 +589,7 @@ async def tomorrow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Ошибка при получении задач на завтра")
         text = f"Не смогла получить задачи: {e}"
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -598,7 +599,7 @@ async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Ошибка при получении задач на неделю")
         text = f"Не смогла получить задачи: {e}"
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 def get_tomorrow_tasks():
@@ -613,13 +614,13 @@ def get_tomorrow_tasks():
 
 
 def format_tomorrow_section(tasks) -> str:
-    lines = ["📅 Завтра:\n"]
+    lines = ["<b>📅 Завтра:</b>\n"]
     if not tasks:
         lines.append("Ничего не запланировано.")
         return "\n".join(lines)
 
     for t in tasks:
-        lines.append(f"• {t['content']}")
+        lines.append(f"• {html.escape(t['content'])}")
     return "\n".join(lines)
 
 
@@ -660,16 +661,27 @@ def format_tasks(tasks, title="Задачи:") -> str:
         pid = t.get("project_id")
         grouped.setdefault(pid, []).append(t)
 
-    lines = [f"{title}\n"]
+    lines = [f"<b>{html.escape(title)}</b>\n"]
     for i, (pid, group) in enumerate(grouped.items()):
         project_name = projects.get(pid, "Без проекта")
         emoji = get_project_emoji(project_name, i)
-        lines.append(f"{emoji} {project_name}")
+        lines.append(f"<b>{emoji} {html.escape(project_name)}</b>")
         for t in group:
-            lines.append(f"• {t['content']}{format_due(t.get('due'))}")
+            lines.append(f"• {html.escape(t['content'])}{format_due(t.get('due'))}")
         lines.append("")
 
     return "\n".join(lines).strip()
+
+
+def create_todoist_task(content: str):
+    response = httpx.post(
+        f"{TODOIST_API_BASE}/tasks",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        json={"content": content},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def get_all_tasks():
@@ -738,7 +750,7 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Ошибка при получении задач")
         text = f"Не смогла получить задачи: {e}"
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 def format_two_sections(today_tasks, overdue_tasks) -> str:
@@ -753,18 +765,18 @@ def format_two_sections(today_tasks, overdue_tasks) -> str:
 
     lines = []
 
-    lines.append("📅 Сегодня:")
+    lines.append("<b>📅 Сегодня:</b>")
     if today_tasks:
         for t in today_tasks:
-            lines.append(f"• {t['content']}{format_due(t.get('due'))}")
+            lines.append(f"• {html.escape(t['content'])}{format_due(t.get('due'))}")
     else:
         lines.append("Ничего на сегодня.")
 
     lines.append("")
-    lines.append("⏰ Просрочено:")
+    lines.append("<b>⏰ Просрочено:</b>")
     if overdue_tasks:
         for t in overdue_tasks:
-            lines.append(f"• {t['content']}{format_due(t.get('due'))}")
+            lines.append(f"• {html.escape(t['content'])}{format_due(t.get('due'))}")
     else:
         lines.append("Просроченного нет.")
 
@@ -797,7 +809,7 @@ async def whoop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Ошибка при получении WHOOP сводки")
         text = f"Не смогла получить данные WHOOP: {e}"
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -810,41 +822,47 @@ async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Ошибка при получении событий календаря")
         text = f"Не смогла получить события: {e}"
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         today_tasks = get_today_only_tasks()
         overdue_tasks = get_overdue_tasks()
-        text = format_two_sections(today_tasks, overdue_tasks)
+        tasks_text = format_two_sections(today_tasks, overdue_tasks)
+
+        parts = []
 
         dym_status = get_dym_status()
         if dym_status:
-            text = f"{dym_status}\n\n{text}"
+            parts.append(dym_status)
 
         weather = get_weather_forecast()
         if weather:
-            text += "\n\n" + weather
+            parts.append(weather)
+
+        parts.append(tasks_text)
 
         if CALENDAR_ENABLED:
             try:
                 events = get_today_calendar_events()
-                text += "\n\n" + format_calendar_section(events)
+                parts.append(format_calendar_section(events))
             except Exception:
                 logger.exception("Ошибка при получении календаря")
-                text += "\n\n🗓️ Календарь: не удалось получить."
+                parts.append("🗓️ Календарь: не удалось получить.")
 
         if WHOOP_ENABLED:
             try:
-                text += "\n\n" + get_whoop_summary()
+                parts.append(get_whoop_summary())
             except Exception:
                 logger.exception("Ошибка при получении WHOOP")
-                text += "\n\n💪 WHOOP: не удалось получить."
+                parts.append("💪 WHOOP: не удалось получить.")
+
+        text = "\n\n".join(parts)
     except Exception as e:
         logger.exception("Ошибка при получении задач на сегодня")
         text = f"Не смогла получить задачи: {e}"
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def backlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -854,41 +872,47 @@ async def backlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Ошибка при получении беклога")
         text = f"Не смогла получить задачи: {e}"
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def send_daily_summary(app: Application):
     try:
         today_tasks = get_today_only_tasks()
         overdue_tasks = get_overdue_tasks()
-        text = format_two_sections(today_tasks, overdue_tasks)
+        tasks_text = format_two_sections(today_tasks, overdue_tasks)
+
+        parts = []
 
         dym_status = get_dym_status()
         if dym_status:
-            text = f"{dym_status}\n\n{text}"
+            parts.append(dym_status)
 
         weather = get_weather_forecast()
         if weather:
-            text += "\n\n" + weather
+            parts.append(weather)
+
+        parts.append(tasks_text)
 
         if CALENDAR_ENABLED:
             try:
                 events = get_today_calendar_events()
-                text += "\n\n" + format_calendar_section(events)
+                parts.append(format_calendar_section(events))
             except Exception:
                 logger.exception("Ошибка при получении календаря для рассылки")
-                text += "\n\n🗓️ Календарь: не удалось получить."
+                parts.append("🗓️ Календарь: не удалось получить.")
 
         if WHOOP_ENABLED:
             try:
-                text += "\n\n" + get_whoop_summary()
+                parts.append(get_whoop_summary())
             except Exception:
                 logger.exception("Ошибка при получении WHOOP для рассылки")
-                text += "\n\n💪 WHOOP: не удалось получить."
+                parts.append("💪 WHOOP: не удалось получить.")
+
+        text = "\n\n".join(parts)
     except Exception as e:
         logger.exception("Ошибка при получении задач для рассылки")
         text = f"Не смогла получить задачи: {e}"
-    await app.bot.send_message(chat_id=CHAT_ID, text=text)
+    await app.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
 
 
 MAIN_KEYBOARD_ROWS = [
@@ -964,15 +988,15 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if dym_status:
         lines.append(f"{dym_status}\n")
 
-    lines.append("❤️ Сегодня у Юлечки такие вот дела:\n")
-
     weather = get_weather_summary()
     if weather:
-        lines.append(f"📍 {weather}\n")
+        lines.append(f"📍 {html.escape(weather)}\n")
+
+    lines.append("<b>❤️ Сегодня у Юлечки такие вот дела:</b>\n")
 
     if today_tasks:
         for t in today_tasks:
-            lines.append(f"• {t['content']}")
+            lines.append(f"• {html.escape(t['content'])}")
     else:
         lines.append("Задач на сегодня нет.")
 
@@ -981,12 +1005,12 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if CALENDAR_ENABLED:
         try:
             calendars = get_today_calendar_events()
-            for _, events in calendars:
+            for _, events, _ in calendars:
                 all_events.extend(events)
             if all_events:
-                lines.append("\n🗓️ Встречи:")
+                lines.append("\n<b>🗓️ Встречи:</b>")
                 for e in all_events:
-                    title = e.get("summary", "Без названия")
+                    title = html.escape(e.get("summary", "Без названия"))
                     start = e.get("start", {})
                     time_str = ""
                     if "dateTime" in start:
@@ -1067,7 +1091,60 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "\n".join(lines)
 
     # Присылаем ей самой — дальше она пересылает это сообщение Саше вручную
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+# Распознавание голосовых сообщений — работает локально на сервере бота,
+# без сторонних платных сервисов. Модель загружается один раз при первом
+# использовании и хранится в памяти.
+_whisper_model = None
+
+
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        # "base" — компромисс между скоростью и качеством, подходит для CPU
+        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+    return _whisper_model
+
+
+def transcribe_voice(file_path: str) -> str:
+    model = get_whisper_model()
+    segments, _ = model.transcribe(file_path, language="ru")
+    return " ".join(segment.text for segment in segments).strip()
+
+
+async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎙️ Слушаю...")
+
+    voice = update.message.voice
+    file = await context.bot.get_file(voice.file_id)
+    file_path = f"/tmp/voice_{voice.file_id}.ogg"
+
+    try:
+        await file.download_to_drive(file_path)
+        text = transcribe_voice(file_path)
+    except Exception as e:
+        logger.exception("Ошибка при распознавании голоса")
+        await update.message.reply_text(f"Не смогла распознать голос: {e}")
+        return
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    if not text:
+        await update.message.reply_text("Не расслышала, попробуй ещё раз или скажи чуть чётче.")
+        return
+
+    await update.message.reply_text(f'Распознала: «{html.escape(text)}»\nДобавляю в Todoist...')
+
+    try:
+        create_todoist_task(text)
+        await update.message.reply_text("✅ Добавила в Todoist.")
+    except Exception as e:
+        logger.exception("Ошибка при добавлении задачи из голоса")
+        await update.message.reply_text(f"Не смогла добавить задачу: {e}")
 
 
 async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1104,6 +1181,7 @@ def main():
     app.add_handler(CommandHandler("calendar", calendar_command))
     app.add_handler(CommandHandler("listcalendars", listcalendars_command))
     app.add_handler(CommandHandler("whoop", whoop_command))
+    app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_button_handler))
 
     hour, minute = map(int, SEND_TIME.split(":"))
