@@ -37,8 +37,11 @@ EXTRA_CALENDARS = [
 CALENDAR_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN)
 
 # Погода для отчёта Саше — через wttr.in, без ключей и регистрации.
-# Город можно сменить в Railway переменной WEATHER_CITY (например Belgrade, если понадобится).
-WEATHER_CITY = os.environ.get("WEATHER_CITY", "Saint Petersburg")
+# Координаты вместо названия города — так надёжнее (иначе "Saint Petersburg" иногда путается
+# с одноимённым городом во Флориде, США, и погода показывает совсем не то полушарие).
+# Текущие: Санкт-Петербург, Россия. Сменить можно в Railway переменной WEATHER_CITY,
+# формат "широта,долгота", например "44.8125,20.4612" для Белграда.
+WEATHER_CITY = os.environ.get("WEATHER_CITY", "59.9311,30.3609")
 
 # Смены Ани во Фридыме — временная штука на пару недель (потом Дым закроется на ремонт).
 # Даты на август 2026, вписаны прямо тут. Когда актуальность пропадёт — удали эту переменную
@@ -46,29 +49,38 @@ WEATHER_CITY = os.environ.get("WEATHER_CITY", "Saint Petersburg")
 ANYA_SHIFT_DAYS = {1, 2, 4, 5, 8, 9, 10, 14, 16, 17, 18, 21, 23, 26, 29, 30}
 
 
-def get_dym_status() -> str:
-    from datetime import datetime
+def get_dym_status(days_ahead: int = 0) -> str:
+    from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
-    today = datetime.now(ZoneInfo(TIMEZONE))
+    target_day = (datetime.now(ZoneInfo(TIMEZONE)) + timedelta(days=days_ahead)).day
 
-    if today.day in ANYA_SHIFT_DAYS:
+    if target_day in ANYA_SHIFT_DAYS:
         return "🟢💨 Благоприятный день, чтобы покурить в Дыме!"
     else:
         return "🔴 В Дыме Татьянин день! Лучше выбрать другое заведение для перекура."
 
 
-def get_weather_summary() -> str:
+WEATHER_CITY_LABEL = os.environ.get("WEATHER_CITY_LABEL", "Санкт-Петербург")
+
+
+def get_weather_current() -> str:
+    # Через JSON-эндпоинт — так единицы измерения (°C) и язык описания надёжно контролируются,
+    # в отличие от текстового формата, где wttr.in сам решает Фаренгейты это или Цельсии.
     try:
         response = httpx.get(
-            f"https://wttr.in/{WEATHER_CITY.replace(' ', '+')}",
-            params={"format": "3", "lang": "ru"},
+            f"https://wttr.in/{WEATHER_CITY}",
+            params={"format": "j1"},
             timeout=10,
         )
         response.raise_for_status()
-        return response.text.strip()
+        data = response.json()
+        current = data["current_condition"][0]
+        temp = current["temp_C"]
+        desc = current["lang_ru"][0]["value"] if current.get("lang_ru") else current["weatherDesc"][0]["value"]
+        return f"{temp}°C, {desc.lower()}"
     except Exception:
-        logger.exception("Ошибка при получении погоды")
+        logger.exception("Ошибка при получении текущей погоды")
         return ""
 
 
@@ -76,7 +88,7 @@ def get_weather_forecast() -> str:
     # Более подробный прогноз: сейчас + макс/мин на сегодня + краткое описание днём
     try:
         response = httpx.get(
-            f"https://wttr.in/{WEATHER_CITY.replace(' ', '+')}",
+            f"https://wttr.in/{WEATHER_CITY}",
             params={"format": "j1"},
             timeout=10,
         )
@@ -301,17 +313,20 @@ def get_whoop_summary() -> str:
         logger.exception("Ошибка при получении WHOOP recovery")
         lines.append("Recovery: не удалось получить.")
 
-    # Сон — берём 2 последние записи для сравнения
+    # Сон — берём с запасом записей, чтобы отфильтровать дневной сон и найти именно ночной
     try:
         s = httpx.get(
             "https://api.prod.whoop.com/developer/v2/activity/sleep",
             headers=headers,
-            params={"limit": 2},
+            params={"limit": 10},
             timeout=15,
         )
         s.raise_for_status()
-        records = s.json().get("records", [])
-        if records and records[0].get("score_state") == "SCORED":
+        all_records = s.json().get("records", [])
+        # Оставляем только ночной сон (nap=False), дневной сон в этот подсчёт не идёт
+        records = [r for r in all_records if r.get("score_state") == "SCORED" and not r.get("nap", False)]
+
+        if records:
             stage = records[0]["score"]["stage_summary"]
             total_ms = (
                 stage["total_light_sleep_time_milli"]
@@ -329,7 +344,7 @@ def get_whoop_summary() -> str:
                 sleep_label = "маловато ❤️❗"
 
             compare = ""
-            if len(records) > 1 and records[1].get("score_state") == "SCORED":
+            if len(records) > 1:
                 prev_stage = records[1]["score"]["stage_summary"]
                 prev_total_ms = (
                     prev_stage["total_light_sleep_time_milli"]
@@ -586,6 +601,10 @@ async def tomorrow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tasks = get_tomorrow_tasks()
         text = format_tomorrow_section(tasks)
+
+        dym_status = get_dym_status(days_ahead=1)
+        if dym_status:
+            text = f"{dym_status}\n\n{text}"
     except Exception as e:
         logger.exception("Ошибка при получении задач на завтра")
         text = f"Не смогла получить задачи: {e}"
@@ -682,6 +701,15 @@ def create_todoist_task(content: str):
     )
     response.raise_for_status()
     return response.json()
+
+
+def close_todoist_task(task_id: str):
+    response = httpx.post(
+        f"{TODOIST_API_BASE}/tasks/{task_id}/close",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        timeout=15,
+    )
+    response.raise_for_status()
 
 
 def get_all_tasks():
@@ -919,7 +947,7 @@ MAIN_KEYBOARD_ROWS = [
     ["📅 Сегодня", "🗂️ Беклог"],
     ["📋 Все задачи", "➡️ Завтра"],
     ["📆 Неделя", "🗓️ Календарь"],
-    ["💪 WHOOP"],
+    ["💪 WHOOP", "✅ Отметить сделанное"],
     ["❤️ Для Саши"],
 ]
 
@@ -988,9 +1016,9 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if dym_status:
         lines.append(f"{dym_status}\n")
 
-    weather = get_weather_summary()
+    weather = get_weather_current()
     if weather:
-        lines.append(f"📍 {html.escape(weather)}\n")
+        lines.append(f"📍 {WEATHER_CITY_LABEL}: {html.escape(weather)}\n")
 
     lines.append("<b>❤️ Сегодня у Юлечки такие вот дела:</b>\n")
 
@@ -1008,13 +1036,19 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for _, events, _ in calendars:
                 all_events.extend(events)
             if all_events:
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
+
                 lines.append("\n<b>🗓️ Встречи:</b>")
                 for e in all_events:
                     title = html.escape(e.get("summary", "Без названия"))
                     start = e.get("start", {})
                     time_str = ""
                     if "dateTime" in start:
-                        time_str = start["dateTime"][11:16] + " — "
+                        dt = datetime.fromisoformat(start["dateTime"])
+                        msk_time = dt.astimezone(ZoneInfo("Europe/Moscow")).strftime("%H:%M")
+                        belgrade_time = dt.astimezone(ZoneInfo("Europe/Belgrade")).strftime("%H:%M")
+                        time_str = f"{msk_time} МСК / {belgrade_time} Белград — "
                     lines.append(f"• {time_str}{title}")
         except Exception:
             logger.exception("Ошибка при получении календаря для Саши")
@@ -1047,12 +1081,16 @@ async def for_sasha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s = httpx.get(
                 "https://api.prod.whoop.com/developer/v2/activity/sleep",
                 headers=headers,
-                params={"limit": 1},
+                params={"limit": 10},
                 timeout=15,
             )
             s.raise_for_status()
-            sleep_records = s.json().get("records", [])
-            if sleep_records and sleep_records[0].get("score_state") == "SCORED":
+            all_sleep_records = s.json().get("records", [])
+            sleep_records = [
+                r for r in all_sleep_records
+                if r.get("score_state") == "SCORED" and not r.get("nap", False)
+            ]
+            if sleep_records:
                 stage = sleep_records[0]["score"]["stage_summary"]
                 total_ms = (
                     stage["total_light_sleep_time_milli"]
@@ -1115,6 +1153,65 @@ def transcribe_voice(file_path: str) -> str:
     return " ".join(segment.text for segment in segments).strip()
 
 
+# Хранит пронумерованный список задач между сообщением /done и ответом с номером.
+# В памяти процесса — этого достаточно, раз ботом пользуется один человек.
+_pending_done_lists = {}
+
+
+async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        overdue_tasks = get_overdue_tasks()
+        today_tasks = get_today_only_tasks()
+        all_tasks = overdue_tasks + today_tasks
+    except Exception as e:
+        logger.exception("Ошибка при получении задач для /done")
+        await update.message.reply_text(f"Не смогла получить задачи: {e}")
+        return
+
+    if not all_tasks:
+        await update.message.reply_text("На сегодня нечего отмечать — всё чисто.")
+        return
+
+    chat_id = update.effective_chat.id
+    numbered = {}
+    lines = ["<b>Что сделано?</b> Ответь номером задачи:\n"]
+    for i, t in enumerate(all_tasks, start=1):
+        numbered[i] = (t["id"], t["content"])
+        lines.append(f"{i}. {html.escape(t['content'])}")
+
+    _pending_done_lists[chat_id] = numbered
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def handle_done_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    # Возвращает True, если сообщение было обработано как ответ на /done
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+
+    if not text.isdigit() or chat_id not in _pending_done_lists:
+        return False
+
+    number = int(text)
+    pending = _pending_done_lists[chat_id]
+
+    if number not in pending:
+        await update.message.reply_text("Нет такого номера в списке. Напиши /done ещё раз, если список устарел.")
+        return True
+
+    task_id, content = pending.pop(number)
+    try:
+        close_todoist_task(task_id)
+        await update.message.reply_text(f"✅ Готово: {html.escape(content)}", parse_mode="HTML")
+    except Exception as e:
+        logger.exception("Ошибка при закрытии задачи через /done")
+        await update.message.reply_text(f"Не смогла отметить задачу: {e}")
+
+    if not pending:
+        del _pending_done_lists[chat_id]
+
+    return True
+
+
 async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🎙️ Слушаю...")
 
@@ -1149,6 +1246,10 @@ async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+
+    if await handle_done_number(update, context):
+        return
+
     if text == "📅 Сегодня":
         await today_command(update, context)
     elif text == "🗂️ Беклог":
@@ -1163,6 +1264,8 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await calendar_command(update, context)
     elif text == "💪 WHOOP":
         await whoop_command(update, context)
+    elif text == "✅ Отметить сделанное":
+        await done_command(update, context)
     elif text == "❤️ Для Саши":
         await for_sasha_handler(update, context)
     else:
@@ -1181,6 +1284,7 @@ def main():
     app.add_handler(CommandHandler("calendar", calendar_command))
     app.add_handler(CommandHandler("listcalendars", listcalendars_command))
     app.add_handler(CommandHandler("whoop", whoop_command))
+    app.add_handler(CommandHandler("done", done_command))
     app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_button_handler))
 
