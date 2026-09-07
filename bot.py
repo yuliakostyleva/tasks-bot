@@ -15,6 +15,7 @@ TODOIST_TOKEN = os.environ["TODOIST_TOKEN"]
 CHAT_ID = int(os.environ["CHAT_ID"])
 # Формат "HH:MM", например "08:00". Часовой пояс задаётся отдельно (см. TIMEZONE ниже)
 SEND_TIME = os.environ.get("SEND_TIME", "08:00")
+EVENING_SEND_TIME = os.environ.get("EVENING_SEND_TIME", "22:30")
 TIMEZONE = os.environ.get("TIMEZONE", "Europe/Belgrade")
 
 # Актуальный (2026) единый Todoist API. Старый rest/v2 отключён (410 Gone).
@@ -43,19 +44,23 @@ CALENDAR_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REF
 # формат "широта,долгота", например "44.8125,20.4612" для Белграда.
 WEATHER_CITY = os.environ.get("WEATHER_CITY", "59.9311,30.3609")
 
-# Смены Ани во Фридыме — временная штука на пару недель (потом Дым закроется на ремонт).
-# Даты на август 2026, вписаны прямо тут. Когда актуальность пропадёт — удали эту переменную
-# и её использование в командах ниже.
-ANYA_SHIFT_DAYS = {1, 2, 4, 5, 8, 9, 10, 14, 16, 17, 18, 21, 23, 26, 29, 30}
+# Смены Ани во Фридыме — временная штука (актуальна только до 11 сентября 2026,
+# дальше правила поставлены на паузу до новых указаний).
+ANYA_SHIFT_DATES = {(9, 2), (9, 5), (9, 6), (9, 7), (9, 10), (9, 11)}
+ANYA_SHIFT_VALID_UNTIL = (2026, 9, 11)  # (год, месяц, день) — включительно
 
 
 def get_dym_status(days_ahead: int = 0) -> str:
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
-    target_day = (datetime.now(ZoneInfo(TIMEZONE)) + timedelta(days=days_ahead)).day
+    target_date = datetime.now(ZoneInfo(TIMEZONE)) + timedelta(days=days_ahead)
+    valid_until = datetime(*ANYA_SHIFT_VALID_UNTIL, 23, 59, 59, tzinfo=target_date.tzinfo)
 
-    if target_day in ANYA_SHIFT_DAYS:
+    if target_date > valid_until:
+        return ""  # правила устарели — молчим, пока не дашь новое расписание
+
+    if (target_date.month, target_date.day) in ANYA_SHIFT_DATES:
         return "🟢💨 Благоприятный день, чтобы покурить в Дыме!"
     else:
         return "🔴 В Дыме Татьянин день! Лучше выбрать другое заведение для перекура."
@@ -712,6 +717,46 @@ def close_todoist_task(task_id: str):
     response.raise_for_status()
 
 
+def get_completed_tasks_today():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    response = httpx.get(
+        f"{TODOIST_API_BASE}/tasks/completed/by_completion_date",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        params={
+            "since": start_of_day.isoformat(),
+            "until": now.isoformat(),
+            "limit": 100,
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json().get("items", [])
+
+
+async def send_evening_summary(app: Application):
+    try:
+        completed = get_completed_tasks_today()
+    except Exception as e:
+        logger.exception("Ошибка при получении выполненных задач для вечерней сводки")
+        await app.bot.send_message(chat_id=CHAT_ID, text=f"Не смогла получить список сделанного: {e}")
+        return
+
+    lines = ["<b>✅ Сделано сегодня:</b>\n"]
+    if completed:
+        for item in completed:
+            lines.append(f"• {html.escape(item.get('content', 'Без названия'))}")
+    else:
+        lines.append("Пока ничего не отмечено выполненным.")
+
+    await app.bot.send_message(chat_id=CHAT_ID, text="\n".join(lines), parse_mode="HTML")
+
+
 def get_all_tasks():
     # Новый API отдаёт результат постранично (cursor), собираем все страницы.
     all_tasks = []
@@ -1289,12 +1334,20 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_button_handler))
 
     hour, minute = map(int, SEND_TIME.split(":"))
+    evening_hour, evening_minute = map(int, EVENING_SEND_TIME.split(":"))
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
     scheduler.add_job(
         send_daily_summary,
         "cron",
         hour=hour,
         minute=minute,
+        args=[app],
+    )
+    scheduler.add_job(
+        send_evening_summary,
+        "cron",
+        hour=evening_hour,
+        minute=evening_minute,
         args=[app],
     )
     scheduler.start()
