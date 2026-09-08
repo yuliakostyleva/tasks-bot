@@ -1,6 +1,8 @@
 import os
 import logging
 import html
+import json
+import base64
 
 import httpx
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
@@ -149,11 +151,20 @@ WATER_REMINDER_HOURS = [
     int(h) for h in os.environ.get("WATER_REMINDER_HOURS", "9,12,15,18,21").split(",") if h.strip()
 ]
 WATER_GOAL_ML = int(os.environ.get("WATER_GOAL_ML", "2000"))
-WATER_QUICK_AMOUNTS = [200, 300, 500]
 
-# Лог воды хранится в памяти процесса (перезапуск при передеплое обнуляет —
+# Типы напитков, которые можно отмечать. amounts — быстрые кнопки для каждого типа.
+# unit — только для отображения в текстах ("мл"/"шт").
+DRINK_TYPES = {
+    "water": {"emoji": "💧", "label": "Вода", "unit": "мл", "amounts": [200, 300, 500]},
+    "coffee": {"emoji": "☕", "label": "Кофе", "unit": "шт", "amounts": [1]},
+    "energy": {"emoji": "⚡", "label": "Энергетик", "unit": "шт", "amounts": [1]},
+    "soda": {"emoji": "🥤", "label": "Газировка/лимонад", "unit": "мл", "amounts": [250, 330, 500]},
+}
+
+# Лог напитков хранится в памяти процесса (перезапуск при передеплое обнуляет —
 # для дневного счётчика это не проблема, он и так должен обнуляться каждый день).
-_water_log = {}  # {"YYYY-MM-DD": total_ml}
+# Структура: {"YYYY-MM-DD": {"water": 500, "coffee": 2, ...}}
+_drinks_log = {}
 
 
 def _today_key() -> str:
@@ -163,22 +174,133 @@ def _today_key() -> str:
     return datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d")
 
 
-def get_water_today_ml() -> int:
-    return _water_log.get(_today_key(), 0)
-
-
-def add_water_ml(amount: int) -> int:
+def add_drink(drink_type: str, amount: int) -> int:
     key = _today_key()
-    _water_log[key] = _water_log.get(key, 0) + amount
-    return _water_log[key]
+    day = _drinks_log.setdefault(key, {})
+    day[drink_type] = day.get(drink_type, 0) + amount
+    return day[drink_type]
 
 
-def water_keyboard() -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(f"+{amount} мл", callback_data=f"water_{amount}")
-        for amount in WATER_QUICK_AMOUNTS
+def get_drinks_today() -> dict:
+    return _drinks_log.get(_today_key(), {})
+
+
+def get_water_today_ml() -> int:
+    return get_drinks_today().get("water", 0)
+
+
+def format_drinks_today() -> str:
+    today = get_drinks_today()
+    if not today:
+        return "пока пусто"
+    parts = []
+    for dtype, meta in DRINK_TYPES.items():
+        amount = today.get(dtype, 0)
+        if amount:
+            parts.append(f"{meta['emoji']} {amount} {meta['unit']}")
+    return ", ".join(parts) if parts else "пока пусто"
+
+
+def drinks_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for dtype, meta in DRINK_TYPES.items():
+        row = [
+            InlineKeyboardButton(
+                f"{meta['emoji']} +{amount} {meta['unit']}"
+                if len(meta["amounts"]) > 1
+                else f"{meta['emoji']} {meta['label']}",
+                callback_data=f"drink_{dtype}_{amount}",
+            )
+            for amount in meta["amounts"]
+        ]
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+# Распознавание напитков через Claude API — по тексту (в т.ч. расшифрованному
+# голосу) или по фото. Опционально: без ключа просто не срабатывает,
+# остальной бот продолжает работать как раньше.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+DRINK_AI_ENABLED = bool(ANTHROPIC_API_KEY)
+
+_DRINK_CLASSIFY_INSTRUCTIONS = """Определи, описывает ли сообщение/фото напиток, который человек только что \
+выпил или собирается выпить прямо сейчас.
+
+Верни ТОЛЬКО JSON, без пояснений и без markdown-разметки, в одном из двух видов:
+{"is_drink": true, "drink_type": "water"|"coffee"|"energy"|"soda", "amount": <число>}
+{"is_drink": false}
+
+drink_type обязательно один из четырёх вариантов выше (water — вода, coffee — кофе/чай/какао, \
+energy — энергетик, soda — газировка/лимонад/сок). Если напиток не подходит ни под один \
+из них уверенно — верни is_drink: false.
+
+amount — количество. Если не указано явно, оцени разумно:
+вода — обычно 300 (мл), кофе — 1 (шт/чашка), энергетик — 1 (шт/банка), газировка/лимонад — 330 (мл)."""
+
+
+def _call_anthropic(content) -> dict | None:
+    try:
+        response = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": content}],
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        raw = "".join(
+            block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
+        ).strip()
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+        parsed = json.loads(raw)
+        if not parsed.get("is_drink"):
+            return None
+        if parsed.get("drink_type") not in DRINK_TYPES:
+            return None
+        return parsed
+    except Exception:
+        logger.exception("Ошибка классификации напитка через Claude API")
+        return None
+
+
+def classify_drink_from_text(text: str) -> dict | None:
+    if not DRINK_AI_ENABLED:
+        return None
+    prompt = f'{_DRINK_CLASSIFY_INSTRUCTIONS}\n\nСообщение: "{text}"'
+    return _call_anthropic(prompt)
+
+
+def classify_drink_from_image(base64_data: str, media_type: str) -> dict | None:
+    if not DRINK_AI_ENABLED:
+        return None
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64_data}},
+        {"type": "text", "text": _DRINK_CLASSIFY_INSTRUCTIONS},
     ]
-    return InlineKeyboardMarkup([buttons])
+    return _call_anthropic(content)
+
+
+def log_classified_drink(result: dict) -> str:
+    drink_type = result["drink_type"]
+    amount = result.get("amount") or DRINK_TYPES[drink_type]["amounts"][0]
+    add_drink(drink_type, amount)
+    meta = DRINK_TYPES[drink_type]
+    return (
+        f"{meta['emoji']} +{amount} {meta['unit']} ({meta['label']}) записано.\n"
+        f"💧 Вода сегодня: {get_water_today_ml()} мл из {WATER_GOAL_ML} мл\n"
+        f"Всего за день: {format_drinks_today()}"
+    )
 
 
 def persist_whoop_refresh_token(new_token: str):
@@ -1329,8 +1451,14 @@ async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Не расслышала, попробуй ещё раз или скажи чуть чётче.")
         return
 
-    await update.message.reply_text(f'Распознала: «{html.escape(text)}»\nДобавляю в Todoist...')
+    await update.message.reply_text(f'Распознала: «{html.escape(text)}»')
 
+    drink_result = classify_drink_from_text(text)
+    if drink_result:
+        await update.message.reply_text(log_classified_drink(drink_result), parse_mode="HTML")
+        return
+
+    await update.message.reply_text("Добавляю в Todoist...")
     try:
         create_todoist_task(text)
         await update.message.reply_text("✅ Добавила в Todoist.")
@@ -1339,37 +1467,87 @@ async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"Не смогла добавить задачу: {e}")
 
 
+async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not DRINK_AI_ENABLED:
+        await update.message.reply_text(
+            "Распознавание фото не настроено — добавь ANTHROPIC_API_KEY в переменные Railway."
+        )
+        return
+
+    await update.message.reply_text("📷 Смотрю...")
+
+    photo = update.message.photo[-1]  # последний элемент — самое высокое разрешение
+    file = await context.bot.get_file(photo.file_id)
+    file_path = f"/tmp/photo_{photo.file_id}.jpg"
+
+    try:
+        await file.download_to_drive(file_path)
+        with open(file_path, "rb") as f:
+            image_b64 = base64.b64encode(f.read()).decode()
+    except Exception as e:
+        logger.exception("Ошибка при загрузке фото")
+        await update.message.reply_text(f"Не смогла обработать фото: {e}")
+        return
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    result = classify_drink_from_image(image_b64, "image/jpeg")
+    if not result:
+        await update.message.reply_text(
+            "Не поняла, что за напиток на фото — можешь отметить вручную через /water."
+        )
+        return
+
+    await update.message.reply_text(log_classified_drink(result), parse_mode="HTML")
+
+
 async def water_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_ml = get_water_today_ml()
-    text = f"💧 Сегодня выпито: <b>{today_ml} мл</b> из {WATER_GOAL_ML} мл\n\nОтметить ещё:"
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=water_keyboard())
+    text = (
+        f"💧 Вода сегодня: <b>{today_ml} мл</b> из {WATER_GOAL_ML} мл\n"
+        f"Всего за день: {format_drinks_today()}\n\nОтметить:"
+    )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=drinks_keyboard())
 
 
-async def water_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def drink_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     try:
-        amount = int(query.data.split("_")[1])
-    except (IndexError, ValueError):
+        _, drink_type, amount_str = query.data.split("_")
+        amount = int(amount_str)
+    except (ValueError, IndexError):
         return
 
-    total = add_water_ml(amount)
-    text = f"💧 +{amount} мл записано. Сегодня всего: <b>{total} мл</b> из {WATER_GOAL_ML} мл"
+    if drink_type not in DRINK_TYPES:
+        return
+
+    add_drink(drink_type, amount)
+    meta = DRINK_TYPES[drink_type]
+    text = (
+        f"{meta['emoji']} +{amount} {meta['unit']} записано.\n"
+        f"💧 Вода сегодня: {get_water_today_ml()} мл из {WATER_GOAL_ML} мл\n"
+        f"Всего за день: {format_drinks_today()}"
+    )
     try:
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=water_keyboard())
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=drinks_keyboard())
     except Exception:
         # Если сообщение уже устарело/удалено — просто шлём новое, не критично
-        await query.message.reply_text(text, parse_mode="HTML", reply_markup=water_keyboard())
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=drinks_keyboard())
 
 
 async def water_reminder_job(app: Application):
     if not WATER_REMINDERS_ENABLED:
         return
     today_ml = get_water_today_ml()
-    text = f"💧 Который час пить воду. Сегодня пока: {today_ml} мл из {WATER_GOAL_ML} мл"
+    text = (
+        f"💧 Который час пить воду. Сегодня пока: {today_ml} мл из {WATER_GOAL_ML} мл\n"
+        "Если пила что-то ещё — тоже можно отметить:"
+    )
     await app.bot.send_message(
-        chat_id=CHAT_ID, text=text, parse_mode="HTML", reply_markup=water_keyboard()
+        chat_id=CHAT_ID, text=text, parse_mode="HTML", reply_markup=drinks_keyboard()
     )
 
 
@@ -1444,7 +1622,11 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif text == "📊 Статус":
         await status_command(update, context)
     else:
-        await update.message.reply_text("Не поняла, воспользуйся кнопками внизу.")
+        drink_result = classify_drink_from_text(text) if DRINK_AI_ENABLED else None
+        if drink_result:
+            await update.message.reply_text(log_classified_drink(drink_result), parse_mode="HTML")
+        else:
+            await update.message.reply_text("Не поняла, воспользуйся кнопками внизу.")
 
 
 def main():
@@ -1462,8 +1644,9 @@ def main():
     app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("water", water_command))
-    app.add_handler(CallbackQueryHandler(water_button_handler, pattern=r"^water_\d+$"))
+    app.add_handler(CallbackQueryHandler(drink_button_handler, pattern=r"^drink_\w+_\d+$"))
     app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_message_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_button_handler))
 
     hour, minute = map(int, SEND_TIME.split(":"))
