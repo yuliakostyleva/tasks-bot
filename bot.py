@@ -303,8 +303,8 @@ def log_classified_drinks(results: list[dict]) -> str:
     header = "Записала:\n" + "\n".join(logged_lines) if len(logged_lines) > 1 else logged_lines[0] + " записано."
     return (
         f"{header}\n\n"
-        f"💧 Вода сегодня: {get_water_today_ml()} мл\n"
-        f"Всего за день: {format_drinks_today()}"
+        f"Всего за день: {format_drinks_today()}\n"
+        f"💧 Из них вода: {get_water_today_ml()} мл"
     )
 
 
@@ -348,13 +348,15 @@ def generate_drink_report() -> str:
     )
 
     prompt = (
-        "Напиши короткий дружеский отчёт (для пересылки друзьям Ане и Саше), подкалывающий Юлю за то, "
+        "Напиши короткий дружеский отчёт (Юля перешлёт его друзьям сама), подкалывающий Юлю за то, "
         "сколько она сегодня выпила. Заголовок ОБЯЗАТЕЛЬНО: «Юля, пей водичку! 💧».\n\n"
         f"Данные за сегодня: {breakdown}.\n\n"
-        "Особый акцент: Аня и Саша не считают кофе/энергетики/газировку водой — и совершенно правы, "
-        "так что если воды мало, а остального много, отдельно подчеркни этот контраст с юмором. "
-        "Никаких врачебных советов, только дружеская подначка. 4-6 строк, простой текст, эмодзи можно, "
-        "markdown-заголовки (##, **) не нужны."
+        "Не упоминай никаких конкретных имён (ни Юли-подруг, ни кому это пересылается) — обращение "
+        "безличное, как будто голос стороннего наблюдателя. Особый акцент: кофе/энергетики/газировка — "
+        "это не вода, так что если воды мало, а остального много, подчеркни этот контраст с юмором. "
+        "Никаких врачебных советов, только дружеская подначка.\n\n"
+        "По оформлению: 3-4 коротких предложения слитным текстом, без списков, без переносов через каждую "
+        "мысль, без обилия эмодзи (максимум 2-3 на весь текст) и без markdown (никаких ##, **, тире-буллетов)."
     )
 
     text = _call_anthropic_raw_text(prompt)
@@ -1575,8 +1577,8 @@ async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 async def water_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_ml = get_water_today_ml()
     text = (
-        f"💧 Вода сегодня: <b>{today_ml} мл</b>\n"
-        f"Всего за день: {format_drinks_today()}\n\nОтметить:"
+        f"Всего за день: {format_drinks_today()}\n"
+        f"💧 Из них вода: <b>{today_ml} мл</b>\n\nОтметить:"
     )
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=drinks_keyboard())
 
@@ -1598,8 +1600,8 @@ async def drink_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     meta = DRINK_TYPES[drink_type]
     text = (
         f"{meta['emoji']} +{amount} {meta['unit']} записано.\n"
-        f"💧 Вода сегодня: {get_water_today_ml()} мл\n"
-        f"Всего за день: {format_drinks_today()}"
+        f"Всего за день: {format_drinks_today()}\n"
+        f"💧 Из них вода: {get_water_today_ml()} мл"
     )
     try:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=drinks_keyboard())
