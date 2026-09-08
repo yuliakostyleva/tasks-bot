@@ -224,22 +224,27 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 DRINK_AI_ENABLED = bool(ANTHROPIC_API_KEY)
 
-_DRINK_CLASSIFY_INSTRUCTIONS = """Определи, описывает ли сообщение/фото напиток, который человек только что \
-выпил или собирается выпить прямо сейчас.
+_DRINK_CLASSIFY_INSTRUCTIONS = """Определи, упоминаются ли в сообщении/на фото напитки, которые человек \
+только что выпил или пьёт прямо сейчас. Сообщение может описывать ОДИН напиток или НЕСКОЛЬКО сразу \
+(например, список за утро/день) — найди их все.
 
-Верни ТОЛЬКО JSON, без пояснений и без markdown-разметки, в одном из двух видов:
-{"is_drink": true, "drink_type": "water"|"coffee"|"energy"|"soda", "amount": <число>}
-{"is_drink": false}
+Верни ТОЛЬКО JSON, без пояснений и без markdown-разметки, в виде:
+{"drinks": [{"drink_type": "water"|"coffee"|"energy"|"soda", "amount": <число>}, ...]}
 
-drink_type обязательно один из четырёх вариантов выше (water — вода, coffee — кофе/чай/какао, \
-energy — энергетик, soda — газировка/лимонад/сок). Если напиток не подходит ни под один \
-из них уверенно — верни is_drink: false.
+Если напитков нет вообще — верни {"drinks": []}.
+
+drink_type обязательно один из четырёх вариантов (water — вода, coffee — кофе/чай/какао/латте/капучино, \
+energy — энергетик, soda — газировка/лимонад/сок). Если какой-то конкретный напиток не подходит ни под \
+один из них уверенно — просто не включай его в список, а не подбирай ближайший.
 
 amount — количество. Если не указано явно, оцени разумно:
-вода — обычно 300 (мл), кофе — 1 (шт/чашка), энергетик — 1 (шт/банка), газировка/лимонад — 330 (мл)."""
+вода — обычно 300 (мл), кофе — 1 (шт/чашка, "половинка кофе" тоже считай за 1), энергетик — 1 (шт/банка), \
+газировка/лимонад — 330 (мл, "стакан" ~250)."""
 
 
-def _call_anthropic(content) -> dict | None:
+def _call_anthropic(content) -> list[dict]:
+    if not DRINK_AI_ENABLED:
+        return []
     try:
         response = httpx.post(
             "https://api.anthropic.com/v1/messages",
@@ -250,7 +255,7 @@ def _call_anthropic(content) -> dict | None:
             },
             json={
                 "model": ANTHROPIC_MODEL,
-                "max_tokens": 200,
+                "max_tokens": 400,
                 "messages": [{"role": "user", "content": content}],
             },
             timeout=30,
@@ -264,26 +269,23 @@ def _call_anthropic(content) -> dict | None:
         if raw.lower().startswith("json"):
             raw = raw[4:].strip()
         parsed = json.loads(raw)
-        if not parsed.get("is_drink"):
-            return None
-        if parsed.get("drink_type") not in DRINK_TYPES:
-            return None
-        return parsed
+        drinks = parsed.get("drinks", [])
+        return [d for d in drinks if d.get("drink_type") in DRINK_TYPES]
     except Exception:
-        logger.exception("Ошибка классификации напитка через Claude API")
-        return None
+        logger.exception("Ошибка классификации напитков через Claude API")
+        return []
 
 
-def classify_drink_from_text(text: str) -> dict | None:
+def classify_drinks_from_text(text: str) -> list[dict]:
     if not DRINK_AI_ENABLED:
-        return None
+        return []
     prompt = f'{_DRINK_CLASSIFY_INSTRUCTIONS}\n\nСообщение: "{text}"'
     return _call_anthropic(prompt)
 
 
-def classify_drink_from_image(base64_data: str, media_type: str) -> dict | None:
+def classify_drinks_from_image(base64_data: str, media_type: str) -> list[dict]:
     if not DRINK_AI_ENABLED:
-        return None
+        return []
     content = [
         {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64_data}},
         {"type": "text", "text": _DRINK_CLASSIFY_INSTRUCTIONS},
@@ -291,16 +293,86 @@ def classify_drink_from_image(base64_data: str, media_type: str) -> dict | None:
     return _call_anthropic(content)
 
 
-def log_classified_drink(result: dict) -> str:
-    drink_type = result["drink_type"]
-    amount = result.get("amount") or DRINK_TYPES[drink_type]["amounts"][0]
-    add_drink(drink_type, amount)
-    meta = DRINK_TYPES[drink_type]
+def log_classified_drinks(results: list[dict]) -> str:
+    logged_lines = []
+    for result in results:
+        drink_type = result["drink_type"]
+        amount = result.get("amount") or DRINK_TYPES[drink_type]["amounts"][0]
+        add_drink(drink_type, amount)
+        meta = DRINK_TYPES[drink_type]
+        logged_lines.append(f"{meta['emoji']} +{amount} {meta['unit']} ({meta['label']})")
+
+    header = "Записала:\n" + "\n".join(logged_lines) if len(logged_lines) > 1 else logged_lines[0] + " записано."
     return (
-        f"{meta['emoji']} +{amount} {meta['unit']} ({meta['label']}) записано.\n"
+        f"{header}\n\n"
         f"💧 Вода сегодня: {get_water_today_ml()} мл из {WATER_GOAL_ML} мл\n"
         f"Всего за день: {format_drinks_today()}"
     )
+
+
+def _call_anthropic_raw_text(content) -> str | None:
+    if not DRINK_AI_ENABLED:
+        return None
+    try:
+        response = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": content}],
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return "".join(
+            block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
+        ).strip()
+    except Exception:
+        logger.exception("Ошибка генерации отчёта по напиткам через Claude API")
+        return None
+
+
+def generate_drink_report() -> str:
+    today = get_drinks_today()
+    if not today:
+        return "Юля, пей водичку! 💧\n\nПравда, сегодня она вообще ничего не пила — пока нечего пересылать 🙂"
+
+    breakdown = ", ".join(
+        f"{meta['label'].lower()}: {today.get(dtype, 0)} {meta['unit']}"
+        for dtype, meta in DRINK_TYPES.items()
+        if today.get(dtype, 0)
+    )
+
+    prompt = (
+        "Напиши короткий дружеский отчёт (для пересылки друзьям Ане и Саше), подкалывающий Юлю за то, "
+        "сколько она сегодня выпила. Заголовок ОБЯЗАТЕЛЬНО: «Юля, пей водичку! 💧».\n\n"
+        f"Данные за сегодня: {breakdown}.\n\n"
+        "Особый акцент: Аня и Саша не считают кофе/энергетики/газировку водой — и совершенно правы, "
+        "так что если воды мало, а остального много, отдельно подчеркни этот контраст с юмором. "
+        "Никаких врачебных советов, только дружеская подначка. 4-6 строк, простой текст, эмодзи можно, "
+        "markdown-заголовки (##, **) не нужны."
+    )
+
+    text = _call_anthropic_raw_text(prompt)
+    if text:
+        return text
+
+    # Фолбэк без ИИ (например, если ключ не настроен) — просто сухие цифры с тем же заголовком
+    water_ml = today.get("water", 0)
+    lines = ["Юля, пей водичку! 💧", ""]
+    for dtype, meta in DRINK_TYPES.items():
+        amount = today.get(dtype, 0)
+        if amount:
+            lines.append(f"{meta['emoji']} {meta['label']}: {amount} {meta['unit']}")
+    if water_ml < 500:
+        lines.append("\nВоды — кот наплакал, остальное почему-то не считается 🙃")
+    return "\n".join(lines)
 
 
 def persist_whoop_refresh_token(new_token: str):
@@ -1162,7 +1234,7 @@ MAIN_KEYBOARD_ROWS = [
     ["📆 Неделя", "🗓️ Календарь"],
     ["💪 WHOOP", "✅ Отметить сделанное"],
     ["💧 Вода", "📊 Статус"],
-    ["❤️ Для Саши"],
+    ["❤️ Для Саши", "😬 Юля, пей водичку"],
 ]
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -1453,9 +1525,9 @@ async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     await update.message.reply_text(f'Распознала: «{html.escape(text)}»')
 
-    drink_result = classify_drink_from_text(text)
-    if drink_result:
-        await update.message.reply_text(log_classified_drink(drink_result), parse_mode="HTML")
+    drink_results = classify_drinks_from_text(text)
+    if drink_results:
+        await update.message.reply_text(log_classified_drinks(drink_results), parse_mode="HTML")
         return
 
     await update.message.reply_text("Добавляю в Todoist...")
@@ -1492,14 +1564,14 @@ async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if os.path.exists(file_path):
             os.remove(file_path)
 
-    result = classify_drink_from_image(image_b64, "image/jpeg")
-    if not result:
+    results = classify_drinks_from_image(image_b64, "image/jpeg")
+    if not results:
         await update.message.reply_text(
             "Не поняла, что за напиток на фото — можешь отметить вручную через /water."
         )
         return
 
-    await update.message.reply_text(log_classified_drink(result), parse_mode="HTML")
+    await update.message.reply_text(log_classified_drinks(results), parse_mode="HTML")
 
 
 async def water_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1593,6 +1665,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Присылаем ей самой — дальше она пересылает Ане/Саше вручную, как с "Для Саши"
+    text = generate_drink_report()
+    await update.message.reply_text(text)
+
+
 async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
@@ -1621,10 +1699,12 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await water_command(update, context)
     elif text == "📊 Статус":
         await status_command(update, context)
+    elif text == "😬 Юля, пей водичку":
+        await report_command(update, context)
     else:
-        drink_result = classify_drink_from_text(text) if DRINK_AI_ENABLED else None
-        if drink_result:
-            await update.message.reply_text(log_classified_drink(drink_result), parse_mode="HTML")
+        drink_results = classify_drinks_from_text(text) if DRINK_AI_ENABLED else []
+        if drink_results:
+            await update.message.reply_text(log_classified_drinks(drink_results), parse_mode="HTML")
         else:
             await update.message.reply_text("Не поняла, воспользуйся кнопками внизу.")
 
@@ -1643,6 +1723,7 @@ def main():
     app.add_handler(CommandHandler("whoop", whoop_command))
     app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("report", report_command))
     app.add_handler(CommandHandler("water", water_command))
     app.add_handler(CallbackQueryHandler(drink_button_handler, pattern=r"^drink_\w+_\d+$"))
     app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
