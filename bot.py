@@ -3,8 +3,15 @@ import logging
 import html
 
 import httpx
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
@@ -133,6 +140,45 @@ RAILWAY_API_TOKEN = os.environ.get("RAILWAY_API_TOKEN")
 RAILWAY_PROJECT_ID = os.environ.get("RAILWAY_PROJECT_ID")
 RAILWAY_ENVIRONMENT_ID = os.environ.get("RAILWAY_ENVIRONMENT_ID")
 RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID")
+
+# Напоминания про воду — включены по умолчанию.
+# WATER_REMINDER_HOURS: часы (по местному TIMEZONE), через запятую, когда присылать пуш.
+# WATER_GOAL_ML: дневная цель, только для отображения прогресса, ни на что не влияет.
+WATER_REMINDERS_ENABLED = os.environ.get("WATER_REMINDERS_ENABLED", "true").lower() != "false"
+WATER_REMINDER_HOURS = [
+    int(h) for h in os.environ.get("WATER_REMINDER_HOURS", "9,12,15,18,21").split(",") if h.strip()
+]
+WATER_GOAL_ML = int(os.environ.get("WATER_GOAL_ML", "2000"))
+WATER_QUICK_AMOUNTS = [200, 300, 500]
+
+# Лог воды хранится в памяти процесса (перезапуск при передеплое обнуляет —
+# для дневного счётчика это не проблема, он и так должен обнуляться каждый день).
+_water_log = {}  # {"YYYY-MM-DD": total_ml}
+
+
+def _today_key() -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d")
+
+
+def get_water_today_ml() -> int:
+    return _water_log.get(_today_key(), 0)
+
+
+def add_water_ml(amount: int) -> int:
+    key = _today_key()
+    _water_log[key] = _water_log.get(key, 0) + amount
+    return _water_log[key]
+
+
+def water_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(f"+{amount} мл", callback_data=f"water_{amount}")
+        for amount in WATER_QUICK_AMOUNTS
+    ]
+    return InlineKeyboardMarkup([buttons])
 
 
 def persist_whoop_refresh_token(new_token: str):
@@ -993,6 +1039,7 @@ MAIN_KEYBOARD_ROWS = [
     ["📋 Все задачи", "➡️ Завтра"],
     ["📆 Неделя", "🗓️ Календарь"],
     ["💪 WHOOP", "✅ Отметить сделанное"],
+    ["💧 Вода", "📊 Статус"],
     ["❤️ Для Саши"],
 ]
 
@@ -1007,8 +1054,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет. Можешь пользоваться кнопками внизу или командами:\n"
         "/today — сегодня и просроченные, отдельными блоками\n"
         "/backlog — задачи без даты\n"
-        "/tasks — срочное + завтра + всё остальное по проектам\n\n"
-        f"Ежедневная сводка (сегодня/просрочено) приходит в {SEND_TIME} ({TIMEZONE}).",
+        "/tasks — срочное + завтра + всё остальное по проектам\n"
+        "/status — проверка, что все интеграции живы (Todoist/Calendar/WHOOP)\n"
+        "/water — сколько воды выпито сегодня + отметить ещё\n\n"
+        f"Ежедневная сводка (сегодня/просрочено) приходит в {SEND_TIME} ({TIMEZONE}).\n"
+        f"Напоминания про воду — в {', '.join(f'{h}:00' for h in WATER_REMINDER_HOURS)} ({TIMEZONE}).",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -1289,6 +1339,82 @@ async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"Не смогла добавить задачу: {e}")
 
 
+async def water_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    today_ml = get_water_today_ml()
+    text = f"💧 Сегодня выпито: <b>{today_ml} мл</b> из {WATER_GOAL_ML} мл\n\nОтметить ещё:"
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=water_keyboard())
+
+
+async def water_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        amount = int(query.data.split("_")[1])
+    except (IndexError, ValueError):
+        return
+
+    total = add_water_ml(amount)
+    text = f"💧 +{amount} мл записано. Сегодня всего: <b>{total} мл</b> из {WATER_GOAL_ML} мл"
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=water_keyboard())
+    except Exception:
+        # Если сообщение уже устарело/удалено — просто шлём новое, не критично
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=water_keyboard())
+
+
+async def water_reminder_job(app: Application):
+    if not WATER_REMINDERS_ENABLED:
+        return
+    today_ml = get_water_today_ml()
+    text = f"💧 Который час пить воду. Сегодня пока: {today_ml} мл из {WATER_GOAL_ML} мл"
+    await app.bot.send_message(
+        chat_id=CHAT_ID, text=text, parse_mode="HTML", reply_markup=water_keyboard()
+    )
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["<b>📊 Статус интеграций</b>\n"]
+
+    try:
+        get_today_only_tasks()
+        lines.append("✅ Todoist")
+    except Exception:
+        logger.exception("Ошибка проверки Todoist в /status")
+        lines.append("⚠️ Todoist — не отвечает, проверь токен")
+
+    if CALENDAR_ENABLED:
+        accounts = [("основной", GOOGLE_REFRESH_TOKEN)]
+        accounts += [
+            (c["label"], c["refresh_token"]) for c in EXTRA_CALENDARS if c["refresh_token"]
+        ]
+        for label, token in accounts:
+            try:
+                get_google_access_token(token)
+                lines.append(f"✅ Google Calendar ({label})")
+            except Exception:
+                logger.exception("Ошибка проверки Google Calendar (%s) в /status", label)
+                lines.append(
+                    f"⚠️ Google Calendar ({label}) — токен не сработал, возможна нужна реавторизация"
+                )
+    else:
+        lines.append("⏸️ Google Calendar не настроен")
+
+    if WHOOP_ENABLED:
+        try:
+            get_whoop_access_token()
+            lines.append("✅ WHOOP")
+        except Exception:
+            logger.exception("Ошибка проверки WHOOP в /status")
+            lines.append("⚠️ WHOOP — токен не сработал, может понадобиться реавторизация через Colab")
+    else:
+        lines.append("⏸️ WHOOP не настроен")
+
+    lines.append(f"\n💧 Вода сегодня: {get_water_today_ml()} мл из {WATER_GOAL_ML} мл")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
@@ -1313,6 +1439,10 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await done_command(update, context)
     elif text == "❤️ Для Саши":
         await for_sasha_handler(update, context)
+    elif text == "💧 Вода":
+        await water_command(update, context)
+    elif text == "📊 Статус":
+        await status_command(update, context)
     else:
         await update.message.reply_text("Не поняла, воспользуйся кнопками внизу.")
 
@@ -1330,6 +1460,9 @@ def main():
     app.add_handler(CommandHandler("listcalendars", listcalendars_command))
     app.add_handler(CommandHandler("whoop", whoop_command))
     app.add_handler(CommandHandler("done", done_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("water", water_command))
+    app.add_handler(CallbackQueryHandler(water_button_handler, pattern=r"^water_\d+$"))
     app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_button_handler))
 
@@ -1350,6 +1483,14 @@ def main():
         minute=evening_minute,
         args=[app],
     )
+    if WATER_REMINDERS_ENABLED and WATER_REMINDER_HOURS:
+        scheduler.add_job(
+            water_reminder_job,
+            "cron",
+            hour=",".join(str(h) for h in WATER_REMINDER_HOURS),
+            minute=0,
+            args=[app],
+        )
     scheduler.start()
 
     logger.info("Бот запущен")
