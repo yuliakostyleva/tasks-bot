@@ -336,6 +336,38 @@ def _call_anthropic_raw_text(content) -> str | None:
         return None
 
 
+def _call_anthropic_json(content) -> dict | None:
+    if not DRINK_AI_ENABLED:
+        return None
+    try:
+        response = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 400,
+                "messages": [{"role": "user", "content": content}],
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        raw = "".join(
+            block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
+        ).strip()
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+        return json.loads(raw)
+    except Exception:
+        logger.exception("Ошибка запроса к Claude API")
+        return None
+
+
 def generate_drink_report() -> str:
     today = get_drinks_today()
     if not today:
@@ -364,7 +396,10 @@ def generate_drink_report() -> str:
 
     text = _call_anthropic_raw_text(prompt)
     if text:
-        return text
+        # На случай, если модель всё же вставит markdown, хотя мы шлём как обычный текст —
+        # звёздочки/решётки иначе останутся в сообщении буквально.
+        text = text.replace("**", "").replace("##", "").replace("# ", "")
+        return text.strip()
 
     # Фолбэк без ИИ (например, если ключ не настроен) — просто сухие цифры с тем же заголовком
     water_ml = today.get("water", 0)
@@ -376,6 +411,146 @@ def generate_drink_report() -> str:
     if water_ml < 500:
         lines.append("\nВоды — кот наплакал, остальное почему-то не считается 🙃")
     return "\n".join(lines)
+
+
+def _forward_classify_instructions(for_image: bool = False) -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TIMEZONE))
+    weekday_names = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+    source = "На фото — скриншот (например запись к врачу, бронирование, приглашение на встречу, список дел)." if for_image else "Тебе прислали пересланное в Telegram сообщение."
+    return (
+        f"Сегодня {now.strftime('%Y-%m-%d')} ({weekday_names[now.weekday()]}), сейчас {now.strftime('%H:%M')} "
+        f"по времени {TIMEZONE}.\n\n"
+        f"{source} Определи, что с этим нужно сделать:\n"
+        '- "task" — дело без привязки к конкретному времени (например «купи хлеб», «пришли мне это»).\n'
+        '- "event" — событие с конкретной датой И временем (например запись к врачу на определённое время, '
+        '«завтра встреча в 9», «15 сентября в 14:00 созвон»).\n'
+        '- "unclear" — похоже на задачу или событие, но не хватает данных (например не указано время '
+        "события), или неоднозначно.\n"
+        '- "none" — явно не требует ни задачи, ни события (случайный скриншот/форвард без действия).\n\n'
+        "Верни ТОЛЬКО JSON, без пояснений:\n"
+        '{"type": "task"|"event"|"unclear"|"none", "content": "<короткая суть, например название приёма/дела>", '
+        '"date": "YYYY-MM-DD или null", "time": "HH:MM или null", '
+        '"question": "<если type=unclear — короткий уточняющий вопрос, иначе null>"}'
+    )
+
+
+def classify_forwarded_message(text: str) -> dict | None:
+    prompt = f'{_forward_classify_instructions()}\n\nСообщение: "{text}"'
+    return _call_anthropic_json(prompt)
+
+
+def classify_forwarded_image(base64_data: str, media_type: str) -> dict | None:
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64_data}},
+        {"type": "text", "text": _forward_classify_instructions(for_image=True)},
+    ]
+    return _call_anthropic_json(content)
+
+
+# Пересланные сообщения, ожидающие уточнения (задача это или событие, какая дата/время) —
+# до ответа на уточняющий вопрос. В памяти процесса, этого достаточно для одного пользователя.
+_pending_forward_clarify = {}
+
+
+async def _create_event_from_result(update: Update, result: dict) -> None:
+    if not CALENDAR_ENABLED:
+        await update.message.reply_text(
+            f"Похоже на событие («{result.get('content')}»), но календарь не настроен — добавь вручную."
+        )
+        return
+
+    date = result.get("date")
+    time_str = result.get("time")
+    if not date or not time_str:
+        chat_id = update.effective_chat.id
+        _pending_forward_clarify[chat_id] = {"content": result.get("content", "")}
+        await update.message.reply_text("❓ Уточни дату и время события (например «12 сентября в 15:00»).")
+        return
+
+    from datetime import datetime, timedelta
+
+    try:
+        start_dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        await update.message.reply_text("Не смогла разобрать дату/время — добавь событие вручную.")
+        return
+
+    end_dt = start_dt + timedelta(hours=1)
+    summary = result.get("content") or "Без названия"
+
+    try:
+        create_google_calendar_event(GOOGLE_REFRESH_TOKEN, summary, start_dt.isoformat(), end_dt.isoformat())
+        await update.message.reply_text(f"✅ Добавила в календарь: {summary}, {start_dt.strftime('%d.%m %H:%M')}")
+    except Exception as e:
+        logger.exception("Ошибка при создании события в календаре из пересланного сообщения")
+        await update.message.reply_text(f"Не смогла добавить событие: {e}")
+
+
+async def _handle_forward_result(update: Update, result: dict) -> None:
+    result_type = result.get("type")
+
+    if result_type == "task":
+        content = result.get("content") or update.message.text or ""
+        try:
+            create_todoist_task(content)
+            await update.message.reply_text(f"✅ Добавила в Todoist: {content}")
+        except Exception as e:
+            logger.exception("Ошибка при добавлении задачи из пересланного сообщения")
+            await update.message.reply_text(f"Не смогла добавить задачу: {e}")
+        return
+
+    if result_type == "event":
+        await _create_event_from_result(update, result)
+        return
+
+    if result_type == "unclear":
+        question = result.get("question") or "Это задача или событие с датой/временем?"
+        chat_id = update.effective_chat.id
+        _pending_forward_clarify[chat_id] = {"content": result.get("content", "")}
+        await update.message.reply_text(f"❓ {question}")
+        return
+
+    await update.message.reply_text("Не поняла, что с этим сделать — добавь вручную, если нужно.")
+
+
+async def forwarded_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if not text:
+        return
+
+    if not DRINK_AI_ENABLED:
+        await update.message.reply_text(
+            "Распознавание пересланных сообщений не настроено — нужен ANTHROPIC_API_KEY."
+        )
+        return
+
+    result = classify_forwarded_message(text)
+    if not result:
+        await update.message.reply_text("Не поняла, что с этим сделать — добавь вручную, если нужно.")
+        return
+
+    await _handle_forward_result(update, result)
+
+
+async def handle_forward_clarification(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    # Возвращает True, если сообщение обработано как ответ на уточняющий вопрос по пересылке
+    chat_id = update.effective_chat.id
+    if chat_id not in _pending_forward_clarify:
+        return False
+
+    pending = _pending_forward_clarify.pop(chat_id)
+    combined = f'{pending.get("content", "")}. Уточнение: {update.message.text}'
+
+    result = classify_forwarded_message(combined)
+    if not result:
+        await update.message.reply_text("Всё ещё не поняла — добавь вручную, если нужно.")
+        return True
+
+    await _handle_forward_result(update, result)
+    return True
 
 
 def persist_whoop_refresh_token(new_token: str):
@@ -661,6 +836,24 @@ def get_google_access_token(refresh_token: str) -> str:
     )
     response.raise_for_status()
     return response.json()["access_token"]
+
+
+def create_google_calendar_event(
+    refresh_token: str, summary: str, start_iso: str, end_iso: str, calendar_id: str = "primary"
+):
+    access_token = get_google_access_token(refresh_token)
+    response = httpx.post(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={
+            "summary": summary,
+            "start": {"dateTime": start_iso, "timeZone": TIMEZONE},
+            "end": {"dateTime": end_iso, "timeZone": TIMEZONE},
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def list_google_calendars(refresh_token: str):
@@ -1567,14 +1760,20 @@ async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if os.path.exists(file_path):
             os.remove(file_path)
 
-    results = classify_drinks_from_image(image_b64, "image/jpeg")
-    if not results:
-        await update.message.reply_text(
-            "Не поняла, что за напиток на фото — можешь отметить вручную через /water."
-        )
+    drink_results = classify_drinks_from_image(image_b64, "image/jpeg")
+    if drink_results:
+        await update.message.reply_text(log_classified_drinks(drink_results), parse_mode="HTML")
         return
 
-    await update.message.reply_text(log_classified_drinks(results), parse_mode="HTML")
+    forward_result = classify_forwarded_image(image_b64, "image/jpeg")
+    if forward_result:
+        await _handle_forward_result(update, forward_result)
+        return
+
+    await update.message.reply_text(
+        "Не поняла, что на фото — если это напиток, отметь вручную через /water; "
+        "если задача или событие, добавь вручную."
+    )
 
 
 async def water_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1685,6 +1884,9 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if await handle_done_number(update, context):
         return
 
+    if await handle_forward_clarification(update, context):
+        return
+
     if text == "📅 Сегодня":
         await today_command(update, context)
     elif text == "🗂️ Беклог":
@@ -1736,6 +1938,9 @@ def main():
     app.add_handler(CallbackQueryHandler(drink_button_handler, pattern=r"^drink_\w+_\d+$"))
     app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_message_handler))
+    app.add_handler(
+        MessageHandler(filters.FORWARDED & filters.TEXT & ~filters.COMMAND, forwarded_message_handler)
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_button_handler))
 
     hour, minute = map(int, SEND_TIME.split(":"))
