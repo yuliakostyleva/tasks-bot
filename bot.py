@@ -145,12 +145,10 @@ RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID")
 
 # Напоминания про воду — включены по умолчанию.
 # WATER_REMINDER_HOURS: часы (по местному TIMEZONE), через запятую, когда присылать пуш.
-# WATER_GOAL_ML: дневная цель, только для отображения прогресса, ни на что не влияет.
 WATER_REMINDERS_ENABLED = os.environ.get("WATER_REMINDERS_ENABLED", "true").lower() != "false"
 WATER_REMINDER_HOURS = [
     int(h) for h in os.environ.get("WATER_REMINDER_HOURS", "9,12,15,18,21").split(",") if h.strip()
 ]
-WATER_GOAL_ML = int(os.environ.get("WATER_GOAL_ML", "2000"))
 
 # Типы напитков, которые можно отмечать. amounts — быстрые кнопки для каждого типа.
 # unit — только для отображения в текстах ("мл"/"шт").
@@ -305,7 +303,7 @@ def log_classified_drinks(results: list[dict]) -> str:
     header = "Записала:\n" + "\n".join(logged_lines) if len(logged_lines) > 1 else logged_lines[0] + " записано."
     return (
         f"{header}\n\n"
-        f"💧 Вода сегодня: {get_water_today_ml()} мл из {WATER_GOAL_ML} мл\n"
+        f"💧 Вода сегодня: {get_water_today_ml()} мл\n"
         f"Всего за день: {format_drinks_today()}"
     )
 
@@ -1577,7 +1575,7 @@ async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 async def water_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_ml = get_water_today_ml()
     text = (
-        f"💧 Вода сегодня: <b>{today_ml} мл</b> из {WATER_GOAL_ML} мл\n"
+        f"💧 Вода сегодня: <b>{today_ml} мл</b>\n"
         f"Всего за день: {format_drinks_today()}\n\nОтметить:"
     )
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=drinks_keyboard())
@@ -1600,7 +1598,7 @@ async def drink_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     meta = DRINK_TYPES[drink_type]
     text = (
         f"{meta['emoji']} +{amount} {meta['unit']} записано.\n"
-        f"💧 Вода сегодня: {get_water_today_ml()} мл из {WATER_GOAL_ML} мл\n"
+        f"💧 Вода сегодня: {get_water_today_ml()} мл\n"
         f"Всего за день: {format_drinks_today()}"
     )
     try:
@@ -1615,7 +1613,7 @@ async def water_reminder_job(app: Application):
         return
     today_ml = get_water_today_ml()
     text = (
-        f"💧 Который час пить воду. Сегодня пока: {today_ml} мл из {WATER_GOAL_ML} мл\n"
+        f"💧 Который час пить воду. Сегодня пока: {today_ml} мл\n"
         "Если пила что-то ещё — тоже можно отметить:"
     )
     await app.bot.send_message(
@@ -1660,7 +1658,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("⏸️ WHOOP не настроен")
 
-    lines.append(f"\n💧 Вода сегодня: {get_water_today_ml()} мл из {WATER_GOAL_ML} мл")
+    if DRINK_AI_ENABLED:
+        lines.append("✅ Claude API (распознавание напитков)")
+    else:
+        lines.append("⏸️ Claude API — нет ANTHROPIC_API_KEY, распознавание напитков не работает")
+
+    lines.append(f"\n💧 Вода сегодня: {get_water_today_ml()} мл")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
