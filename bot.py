@@ -183,6 +183,21 @@ WATER_REMINDER_HOURS = [
     int(h) for h in os.environ.get("WATER_REMINDER_HOURS", "9,12,15,18,21").split(",") if h.strip()
 ]
 
+# Напоминания о ДР — за сколько дней предупреждать (0 = в сам день). По умолчанию за 3 дня и в день ДР.
+BIRTHDAY_REMINDERS_ENABLED = os.environ.get("BIRTHDAY_REMINDERS_ENABLED", "true").lower() != "false"
+BIRTHDAY_REMINDER_DAYS = [
+    int(d) for d in os.environ.get("BIRTHDAY_REMINDER_DAYS", "3,0").split(",") if d.strip()
+]
+BIRTHDAY_CALENDAR_ID = "de7100c3a9532829d193b591ea59caa68bd523ee186ebf252ffc858cc1e63b8e@group.calendar.google.com"
+
+# Обратный отсчёт для важных дедлайнов (аудиты, ТЗ и т.п.) — только для задач Todoist
+# с этим лейблом, а не для всех задач подряд. Лейбл нужно проставлять в Todoist вручную.
+DEADLINE_REMINDERS_ENABLED = os.environ.get("DEADLINE_REMINDERS_ENABLED", "true").lower() != "false"
+IMPORTANT_DEADLINE_LABEL = os.environ.get("IMPORTANT_DEADLINE_LABEL", "важное")
+DEADLINE_REMINDER_DAYS = [
+    int(d) for d in os.environ.get("DEADLINE_REMINDER_DAYS", "3,1,0").split(",") if d.strip()
+]
+
 # Типы напитков, которые можно отмечать. amounts — быстрые кнопки для каждого типа.
 # unit — только для отображения в текстах ("мл"/"шт").
 DRINK_TYPES = {
@@ -382,7 +397,7 @@ def _call_anthropic_json(content) -> dict | None:
             },
             json={
                 "model": ANTHROPIC_MODEL,
-                "max_tokens": 400,
+                "max_tokens": 800,
                 "messages": [{"role": "user", "content": content}],
             },
             timeout=30,
@@ -1031,7 +1046,56 @@ def update_google_calendar_event(
     return response.json()
 
 
-def list_google_calendars(refresh_token: str):
+def create_recurring_birthday_event(
+    refresh_token: str, calendar_id: str, summary: str, month: int, day: int, year: int | None = None
+):
+    from datetime import date, timedelta
+
+    # Год ставим текущий (или ближайший будущий), если год рождения неизвестен —
+    # RRULE:FREQ=YEARLY заставит Google Calendar повторять событие каждый год всё равно.
+    today = date.today()
+    base_year = year or today.year
+    try:
+        event_date = date(base_year, month, day)
+    except ValueError:
+        raise ValueError(f"Некорректная дата: {base_year}-{month:02d}-{day:02d}")
+
+    if year is None and event_date < today:
+        event_date = date(today.year + 1, month, day)
+
+    end_date = event_date + timedelta(days=1)
+
+    access_token = get_google_access_token(refresh_token)
+    response = httpx.post(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={
+            "summary": summary,
+            "start": {"date": event_date.isoformat()},
+            "end": {"date": end_date.isoformat()},
+            "recurrence": ["RRULE:FREQ=YEARLY"],
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def classify_birthday_list(text: str) -> list[dict]:
+    prompt = (
+        "Пользователь прислал список дней рождения в свободной форме (имя и дата, в любом порядке "
+        "и формате — текстом, цифрами, с годом или без). Извлеки каждую запись отдельно.\n\n"
+        "Верни ТОЛЬКО JSON, без пояснений:\n"
+        '{"birthdays": [{"name": "<имя>", "month": <1-12>, "day": <1-31>, '
+        '"year": <год рождения, если указан явно, иначе null>}]}\n\n'
+        f'Текст: "{text}"'
+    )
+    result = _call_anthropic_json(prompt)
+    if not result:
+        return []
+    return result.get("birthdays", [])
+
+
     access_token = get_google_access_token(refresh_token)
     response = httpx.get(
         "https://www.googleapis.com/calendar/v3/users/me/calendarList",
@@ -1062,6 +1126,34 @@ def get_today_events_for_token(refresh_token: str, calendar_id: str = "primary")
         params={
             "timeMin": start_of_day.isoformat(),
             "timeMax": end_of_day.isoformat(),
+            "singleEvents": "true",
+            "orderBy": "startTime",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json().get("items", [])
+
+
+def get_calendar_events_range(refresh_token: str, calendar_id: str, days_ahead: int):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    from urllib.parse import quote
+
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = (start + timedelta(days=days_ahead)).replace(hour=23, minute=59, second=59, microsecond=0)
+
+    access_token = get_google_access_token(refresh_token)
+    encoded_id = quote(calendar_id, safe="")
+
+    response = httpx.get(
+        f"https://www.googleapis.com/calendar/v3/calendars/{encoded_id}/events",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={
+            "timeMin": start.isoformat(),
+            "timeMax": end.isoformat(),
             "singleEvents": "true",
             "orderBy": "startTime",
         },
@@ -1417,6 +1509,17 @@ def get_overdue_tasks():
     return response.json().get("results", [])
 
 
+def get_important_deadline_tasks():
+    response = httpx.get(
+        f"{TODOIST_API_BASE}/tasks/filter",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        params={"query": f"@{IMPORTANT_DEADLINE_LABEL}"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json().get("results", [])
+
+
 def get_today_tasks():
     # Оставлено для рассылки/остальных мест, где нужны "сегодня + просрочено" вместе
     return get_today_only_tasks() + get_overdue_tasks()
@@ -1621,7 +1724,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/backlog — задачи без даты\n"
         "/tasks — срочное + завтра + всё остальное по проектам\n"
         "/status — проверка, что все интеграции живы (Todoist/Calendar/WHOOP)\n"
-        "/water — сколько воды выпито сегодня + отметить ещё\n\n"
+        "/water — сколько воды выпито сегодня + отметить ещё\n"
+        "/birthdays — ближайшие ДР из календаря\n"
+        f"/deadlines — задачи с лейблом «{IMPORTANT_DEADLINE_LABEL}» и приближающимся дедлайном\n\n"
         f"Ежедневная сводка (сегодня/просрочено) приходит в {SEND_TIME} ({TIMEZONE}).\n"
         f"Напоминания про воду — в {', '.join(f'{h}:00' for h in WATER_REMINDER_HOURS)} ({TIMEZONE}).",
         reply_markup=MAIN_KEYBOARD,
@@ -2007,6 +2112,174 @@ async def water_reminder_job(app: Application):
     )
 
 
+def check_upcoming_birthdays() -> list[str]:
+    if not CALENDAR_ENABLED:
+        return []
+
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    days_ahead = max(BIRTHDAY_REMINDER_DAYS) + 1
+    events = []
+
+    # Календарь "ДР в Фридым" — там сплошь дни рождения, берём всё как есть
+    try:
+        events += get_calendar_events_range(GOOGLE_REFRESH_TOKEN, BIRTHDAY_CALENDAR_ID, days_ahead)
+    except Exception:
+        logger.exception("Ошибка получения календаря ДР в Фридым")
+
+    # Основной календарь — там вперемешку разное, берём только события с меткой 🎂
+    # (так их помечает /addbirthdays)
+    try:
+        primary_events = get_calendar_events_range(GOOGLE_REFRESH_TOKEN, "primary", days_ahead)
+        events += [e for e in primary_events if e.get("summary", "").strip().startswith("🎂")]
+    except Exception:
+        logger.exception("Ошибка получения основного календаря для ДР")
+
+    today = datetime.now(ZoneInfo(TIMEZONE)).date()
+    lines = []
+    for event in events:
+        start = event.get("start", {})
+        date_str = start.get("date") or (start.get("dateTime", "")[:10] if start.get("dateTime") else None)
+        if not date_str:
+            continue
+        try:
+            event_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        delta = (event_date - today).days
+        if delta not in BIRTHDAY_REMINDER_DAYS:
+            continue
+        summary = event.get("summary", "День рождения").lstrip("🎂").strip()
+        if delta == 0:
+            lines.append(f"🎂 Сегодня: {summary}!")
+        else:
+            lines.append(f"🎂 Через {delta} дн. ({event_date.strftime('%d.%m')}): {summary}")
+    return lines
+
+
+async def birthday_reminder_job(app: Application):
+    if not BIRTHDAY_REMINDERS_ENABLED:
+        return
+    lines = check_upcoming_birthdays()
+    if lines:
+        await app.bot.send_message(chat_id=CHAT_ID, text="\n".join(lines))
+
+
+def check_important_deadlines() -> list[str]:
+    from datetime import datetime
+
+    try:
+        tasks = get_important_deadline_tasks()
+    except Exception:
+        logger.exception("Ошибка получения задач с дедлайном для напоминаний")
+        return []
+
+    from zoneinfo import ZoneInfo
+
+    today = datetime.now(ZoneInfo(TIMEZONE)).date()
+    lines = []
+    for task in tasks:
+        due = task.get("due")
+        if not due or not due.get("date"):
+            continue
+        try:
+            due_date = datetime.strptime(due["date"][:10], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        delta = (due_date - today).days
+        content = task.get("content", "Задача")
+        if delta < 0:
+            lines.append(f"🔴 Просрочено на {-delta} дн.: {content}")
+        elif delta == 0:
+            lines.append(f"🔴 Сегодня дедлайн: {content}")
+        elif delta in DEADLINE_REMINDER_DAYS:
+            lines.append(f"⏳ Осталось {delta} дн. ({due_date.strftime('%d.%m')}): {content}")
+    return lines
+
+
+async def deadline_reminder_job(app: Application):
+    if not DEADLINE_REMINDERS_ENABLED:
+        return
+    lines = check_important_deadlines()
+    if lines:
+        text = f"<b>Дедлайны по «{IMPORTANT_DEADLINE_LABEL}»:</b>\n" + "\n".join(lines)
+        await app.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+
+
+async def birthdays_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = check_upcoming_birthdays()
+    text = "\n".join(lines) if lines else f"Ближайших {max(BIRTHDAY_REMINDER_DAYS)} дней без ДР в календаре."
+    await update.message.reply_text(text)
+
+
+# Чаты, ожидающие список ДР для импорта после команды /addbirthdays
+_pending_birthday_import = set()
+
+
+async def addbirthdays_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _pending_birthday_import.add(update.effective_chat.id)
+    await update.message.reply_text(
+        "Пришли список ДР одним сообщением, в любом формате — например:\n"
+        "Аня — 15 марта\nСаша — 3 сентября 1990"
+    )
+
+
+async def handle_birthday_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat_id = update.effective_chat.id
+    if chat_id not in _pending_birthday_import:
+        return False
+    _pending_birthday_import.discard(chat_id)
+
+    if not CALENDAR_ENABLED:
+        await update.message.reply_text("Календарь не настроен — не могу добавить.")
+        return True
+    if not DRINK_AI_ENABLED:
+        await update.message.reply_text("Нужен ANTHROPIC_API_KEY, чтобы разбирать список — сейчас не настроен.")
+        return True
+
+    entries = classify_birthday_list(update.message.text)
+    if not entries:
+        await update.message.reply_text("Не смогла разобрать ни одной записи — попробуй ещё раз, по-другому.")
+        return True
+
+    added = []
+    failed = []
+    for entry in entries:
+        name = entry.get("name") or "Без имени"
+        month = entry.get("month")
+        day = entry.get("day")
+        year = entry.get("year")
+        if not month or not day:
+            failed.append(name)
+            continue
+        try:
+            create_recurring_birthday_event(
+                GOOGLE_REFRESH_TOKEN, "primary", f"🎂 {name}", month, day, year
+            )
+            added.append(f"{name} ({day:02d}.{month:02d}{f'.{year}' if year else ''})")
+        except Exception:
+            logger.exception("Ошибка при добавлении ДР в календарь: %s", name)
+            failed.append(name)
+
+    lines = []
+    if added:
+        lines.append("✅ Добавила:\n" + "\n".join(added))
+    if failed:
+        lines.append("⚠️ Не разобрала:\n" + "\n".join(failed))
+    await update.message.reply_text("\n\n".join(lines))
+    return True
+
+
+async def deadlines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = check_important_deadlines()
+    if lines:
+        text = f"<b>Дедлайны по «{IMPORTANT_DEADLINE_LABEL}»:</b>\n" + "\n".join(lines)
+    else:
+        text = f"Нет задач с лейблом «{IMPORTANT_DEADLINE_LABEL}» с приближающимся дедлайном."
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["<b>📊 Статус интеграций</b>\n"]
 
@@ -2066,6 +2339,9 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if await handle_done_number(update, context):
         return
 
+    if await handle_birthday_import(update, context):
+        return
+
     if await handle_forward_clarification(update, context):
         return
 
@@ -2119,6 +2395,9 @@ def main():
     app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("report", report_command))
+    app.add_handler(CommandHandler("birthdays", birthdays_command))
+    app.add_handler(CommandHandler("addbirthdays", addbirthdays_command))
+    app.add_handler(CommandHandler("deadlines", deadlines_command))
     app.add_handler(CommandHandler("water", water_command))
     app.add_handler(CallbackQueryHandler(drink_button_handler, pattern=r"^drink_\w+_\d+$"))
     app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
@@ -2151,6 +2430,22 @@ def main():
             "cron",
             hour=",".join(str(h) for h in WATER_REMINDER_HOURS),
             minute=0,
+            args=[app],
+        )
+    if BIRTHDAY_REMINDERS_ENABLED:
+        scheduler.add_job(
+            birthday_reminder_job,
+            "cron",
+            hour=hour,
+            minute=(minute + 10) % 60,
+            args=[app],
+        )
+    if DEADLINE_REMINDERS_ENABLED:
+        scheduler.add_job(
+            deadline_reminder_job,
+            "cron",
+            hour=hour,
+            minute=(minute + 20) % 60,
             args=[app],
         )
     scheduler.start()
