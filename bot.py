@@ -143,6 +143,39 @@ RAILWAY_PROJECT_ID = os.environ.get("RAILWAY_PROJECT_ID")
 RAILWAY_ENVIRONMENT_ID = os.environ.get("RAILWAY_ENVIRONMENT_ID")
 RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID")
 
+# Google Places API — опционально, для поиска точного адреса места по названию
+# (например "Tenders Lounge") при создании события в календаре из пересланного
+# сообщения. Без ключа просто не ищет адрес и полагается на то, что сказано в тексте.
+PLACES_API_KEY = os.environ.get("PLACES_API_KEY")
+
+
+def search_place(query: str) -> dict | None:
+    if not PLACES_API_KEY or not query:
+        return None
+    try:
+        response = httpx.post(
+            "https://places.googleapis.com/v1/places:searchText",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": PLACES_API_KEY,
+                "X-Goog-FieldMask": "places.displayName,places.formattedAddress",
+            },
+            json={"textQuery": query},
+            timeout=15,
+        )
+        response.raise_for_status()
+        places = response.json().get("places", [])
+        if not places:
+            return None
+        top = places[0]
+        return {
+            "name": top.get("displayName", {}).get("text"),
+            "address": top.get("formattedAddress"),
+        }
+    except Exception:
+        logger.exception("Ошибка поиска места через Google Places API")
+        return None
+
 # Напоминания про воду — включены по умолчанию.
 # WATER_REMINDER_HOURS: часы (по местному TIMEZONE), через запятую, когда присылать пуш.
 WATER_REMINDERS_ENABLED = os.environ.get("WATER_REMINDERS_ENABLED", "true").lower() != "false"
@@ -451,6 +484,8 @@ def _forward_classify_instructions(for_image: bool = False) -> str:
         "Верни ТОЛЬКО JSON, без пояснений:\n"
         '{"type": "task"|"event"|"unclear"|"none", "content": "<короткая суть, например название приёма/дела>", '
         '"date": "YYYY-MM-DD или null", "time": "HH:MM или null", '
+        '"location_name": "<если type=event и упомянуто конкретное место/заведение — только его название '
+        'без адреса и лишних слов, например «Tenders Lounge», иначе null>", '
         '"question": "<если type=unclear — короткий уточняющий вопрос, иначе null>"}'
     )
 
@@ -471,6 +506,10 @@ def classify_forwarded_image(base64_data: str, media_type: str) -> dict | None:
 # Пересланные сообщения, ожидающие уточнения (задача это или событие, какая дата/время) —
 # до ответа на уточняющий вопрос. В памяти процесса, этого достаточно для одного пользователя.
 _pending_forward_clarify = {}
+
+# Последнее созданное через бота событие в каждом чате — чтобы следующее сообщение вроде
+# "поправь адрес" можно было применить к нему, а не создавать новое событие с нуля.
+_last_created_event = {}
 
 
 async def _create_event_from_result(update: Update, result: dict) -> None:
@@ -498,10 +537,37 @@ async def _create_event_from_result(update: Update, result: dict) -> None:
 
     end_dt = start_dt + timedelta(hours=1)
     summary = result.get("content") or "Без названия"
+    location_name = result.get("location_name")
+
+    location_address = None
+    address_note = ""
+    if location_name:
+        place = search_place(location_name)
+        if place and place.get("address"):
+            location_address = place["address"]
+        else:
+            address_note = f"\n\n📍 Не нашла точный адрес места «{location_name}» — если знаешь, напиши его следующим сообщением, добавлю в событие."
 
     try:
-        create_google_calendar_event(GOOGLE_REFRESH_TOKEN, summary, start_dt.isoformat(), end_dt.isoformat())
-        await update.message.reply_text(f"✅ Добавила в календарь: {summary}, {start_dt.strftime('%d.%m %H:%M')}")
+        event = create_google_calendar_event(
+            GOOGLE_REFRESH_TOKEN,
+            summary,
+            start_dt.isoformat(),
+            end_dt.isoformat(),
+            location=location_address,
+        )
+        _last_created_event[update.effective_chat.id] = {
+            "event_id": event["id"],
+            "calendar_id": "primary",
+            "refresh_token": GOOGLE_REFRESH_TOKEN,
+            "summary": summary,
+            "start_dt": start_dt,
+            "created_at": datetime.now(),
+        }
+        confirmation = f"✅ Добавила в календарь: {summary}, {start_dt.strftime('%d.%m %H:%M')}"
+        if location_address:
+            confirmation += f"\n📍 {location_address}"
+        await update.message.reply_text(confirmation + address_note)
     except Exception as e:
         logger.exception("Ошибка при создании события в календаре из пересланного сообщения")
         await update.message.reply_text(f"Не смогла добавить событие: {e}")
@@ -568,6 +634,75 @@ async def handle_forward_clarification(update: Update, context: ContextTypes.DEF
         return True
 
     await _handle_forward_result(update, result)
+    return True
+
+
+def classify_event_correction(text: str, last_event: dict) -> dict | None:
+    prompt = (
+        f"Только что было создано календарное событие: «{last_event['summary']}», "
+        f"{last_event['start_dt'].strftime('%Y-%m-%d %H:%M')}.\n\n"
+        "Следующее сообщение от пользователя может быть исправлением/уточнением этого события "
+        "(например, поправить название, сообщить точный адрес места, изменить дату/время). "
+        "Определи, так ли это. Если сообщение — это просто адрес или название заведения "
+        "(ответ на вопрос «какой адрес») — это тоже исправление, используй поле location.\n\n"
+        "Верни ТОЛЬКО JSON:\n"
+        '{"is_correction": true|false, "summary": "<новое название события — или null, если не меняется>", '
+        '"location": "<точный адрес/место, если сообщён — или null>", '
+        '"date": "YYYY-MM-DD или null, только если дата меняется", '
+        '"time": "HH:MM или null, только если время меняется"}\n\n'
+        f'Сообщение: "{text}"'
+    )
+    return _call_anthropic_json(prompt)
+
+
+async def handle_event_correction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    # Возвращает True, если сообщение обработано как исправление последнего созданного события
+    chat_id = update.effective_chat.id
+    if not DRINK_AI_ENABLED or chat_id not in _last_created_event:
+        return False
+
+    last = _last_created_event[chat_id]
+
+    from datetime import datetime as _dt, timedelta as _td
+
+    if _dt.now() - last["created_at"] > _td(minutes=15):
+        del _last_created_event[chat_id]
+        return False
+
+    correction = classify_event_correction(update.message.text, last)
+    if not correction or not correction.get("is_correction"):
+        return False
+
+    from datetime import datetime, timedelta
+
+    updates = {}
+    if correction.get("summary"):
+        updates["summary"] = correction["summary"]
+        last["summary"] = correction["summary"]
+    if correction.get("location"):
+        updates["location"] = correction["location"]
+    if correction.get("date") and correction.get("time"):
+        try:
+            new_start = datetime.strptime(f'{correction["date"]} {correction["time"]}', "%Y-%m-%d %H:%M")
+            updates["start"] = {"dateTime": new_start.isoformat(), "timeZone": TIMEZONE}
+            updates["end"] = {"dateTime": (new_start + timedelta(hours=1)).isoformat(), "timeZone": TIMEZONE}
+            last["start_dt"] = new_start
+        except ValueError:
+            pass
+
+    if not updates:
+        await update.message.reply_text("Поняла, что это про событие, но не разобрала, что именно поменять.")
+        return True
+
+    try:
+        update_google_calendar_event(last["refresh_token"], last["event_id"], updates, last["calendar_id"])
+        confirmation = f"✅ Обновила событие: {last['summary']}, {last['start_dt'].strftime('%d.%m %H:%M')}"
+        if updates.get("location"):
+            confirmation += f"\n📍 {updates['location']}"
+        await update.message.reply_text(confirmation)
+    except Exception as e:
+        logger.exception("Ошибка при обновлении события в календаре")
+        await update.message.reply_text(f"Не смогла обновить событие: {e}")
     return True
 
 
@@ -857,17 +992,39 @@ def get_google_access_token(refresh_token: str) -> str:
 
 
 def create_google_calendar_event(
-    refresh_token: str, summary: str, start_iso: str, end_iso: str, calendar_id: str = "primary"
+    refresh_token: str,
+    summary: str,
+    start_iso: str,
+    end_iso: str,
+    calendar_id: str = "primary",
+    location: str | None = None,
 ):
     access_token = get_google_access_token(refresh_token)
+    payload = {
+        "summary": summary,
+        "start": {"dateTime": start_iso, "timeZone": TIMEZONE},
+        "end": {"dateTime": end_iso, "timeZone": TIMEZONE},
+    }
+    if location:
+        payload["location"] = location
     response = httpx.post(
         f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
         headers={"Authorization": f"Bearer {access_token}"},
-        json={
-            "summary": summary,
-            "start": {"dateTime": start_iso, "timeZone": TIMEZONE},
-            "end": {"dateTime": end_iso, "timeZone": TIMEZONE},
-        },
+        json=payload,
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def update_google_calendar_event(
+    refresh_token: str, event_id: str, updates: dict, calendar_id: str = "primary"
+):
+    access_token = get_google_access_token(refresh_token)
+    response = httpx.patch(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json=updates,
         timeout=15,
     )
     response.raise_for_status()
@@ -1910,6 +2067,9 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if await handle_forward_clarification(update, context):
+        return
+
+    if await handle_event_correction(update, context):
         return
 
     if text == "📅 Сегодня":
