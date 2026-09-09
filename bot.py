@@ -177,13 +177,6 @@ def search_place(query: str) -> dict | None:
         logger.exception("Ошибка поиска места через Google Places API")
         return None
 
-# Напоминания про воду — включены по умолчанию.
-# WATER_REMINDER_HOURS: часы (по местному TIMEZONE), через запятую, когда присылать пуш.
-WATER_REMINDERS_ENABLED = os.environ.get("WATER_REMINDERS_ENABLED", "true").lower() != "false"
-WATER_REMINDER_HOURS = [
-    int(h) for h in os.environ.get("WATER_REMINDER_HOURS", "9,12,15,18,21").split(",") if h.strip()
-]
-
 # Напоминания о ДР — за сколько дней предупреждать (0 = в сам день). По умолчанию за 3 дня и в день ДР.
 BIRTHDAY_REMINDERS_ENABLED = os.environ.get("BIRTHDAY_REMINDERS_ENABLED", "true").lower() != "false"
 BIRTHDAY_REMINDER_DAYS = [
@@ -223,6 +216,11 @@ GMAIL_SKIP_DOMAINS = ["accounts.google.com", "binance.com", "whoop.com", "wise.c
 # Особое правило: письма от "ленсбыт" → квитанция (PDF) прикладывается к задаче в Todoist
 GMAIL_LENSBYT_MATCH = "ленсбыт"
 GMAIL_LENSBYT_TODOIST_TASK_SEARCH = "Сарженку"
+
+# ID писем, которые уже разобраны (показаны в срочном или отправлены в ленсбыт-обработку) —
+# чтобы не показывать одно и то же непрочитанное письмо повторно при каждой проверке.
+# Живёт в памяти процесса — сбрасывается при передеплое.
+_seen_email_ids: set[str] = set()
 
 # Типы напитков, которые можно отмечать. amounts — быстрые кнопки для каждого типа.
 # unit — только для отображения в текстах ("мл"/"шт").
@@ -1864,8 +1862,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/birthdays — ближайшие ДР из календаря\n"
         f"/deadlines — задачи с лейблом «{IMPORTANT_DEADLINE_LABEL}» и приближающимся дедлайном\n"
         "/mail — срочное из непрочитанной почты\n\n"
-        f"Ежедневная сводка (сегодня/просрочено) приходит в {SEND_TIME} ({TIMEZONE}).\n"
-        f"Напоминания про воду — в {', '.join(f'{h}:00' for h in WATER_REMINDER_HOURS)} ({TIMEZONE}).",
+        f"Ежедневная сводка (сегодня/просрочено) приходит в {SEND_TIME} ({TIMEZONE}).",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -2236,18 +2233,6 @@ async def drink_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text(text, parse_mode="HTML", reply_markup=drinks_keyboard())
 
 
-async def water_reminder_job(app: Application):
-    if not WATER_REMINDERS_ENABLED:
-        return
-    today_ml = get_water_today_ml()
-    text = (
-        f"💧 Который час пить воду. Сегодня пока: {today_ml} мл\n"
-        "Если пила что-то ещё — тоже можно отметить:"
-    )
-    await app.bot.send_message(
-        chat_id=CHAT_ID, text=text, parse_mode="HTML", reply_markup=drinks_keyboard()
-    )
-
 
 def check_upcoming_birthdays() -> list[str]:
     if not CALENDAR_ENABLED:
@@ -2403,11 +2388,15 @@ def build_email_digest_lines() -> list[str]:
 
     lines = []
     for m in messages:
+        msg_id = m["id"]
+        if msg_id in _seen_email_ids:
+            continue
         try:
-            msg = get_gmail_message_metadata(m["id"])
+            msg = get_gmail_message_metadata(msg_id)
         except Exception:
             logger.exception("Ошибка получения письма Gmail")
             continue
+        _seen_email_ids.add(msg_id)
 
         result = classify_gmail_message(msg)
         bucket = result["bucket"]
@@ -2706,14 +2695,6 @@ def main():
         minute=evening_minute,
         args=[app],
     )
-    if WATER_REMINDERS_ENABLED and WATER_REMINDER_HOURS:
-        scheduler.add_job(
-            water_reminder_job,
-            "cron",
-            hour=",".join(str(h) for h in WATER_REMINDER_HOURS),
-            minute=0,
-            args=[app],
-        )
     if BIRTHDAY_REMINDERS_ENABLED:
         scheduler.add_job(
             birthday_reminder_job,
