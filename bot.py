@@ -3,6 +3,7 @@ import logging
 import html
 import json
 import base64
+import re
 
 import httpx
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
@@ -197,6 +198,31 @@ IMPORTANT_DEADLINE_LABEL = os.environ.get("IMPORTANT_DEADLINE_LABEL", "важн�
 DEADLINE_REMINDER_DAYS = [
     int(d) for d in os.environ.get("DEADLINE_REMINDER_DAYS", "3,1,0").split(",") if d.strip()
 ]
+
+# Дайджест почты (Gmail) — читает основной аккаунт (GOOGLE_REFRESH_TOKEN), тому же
+# refresh-токену нужен ещё scope gmail.readonly в дополнение к calendar.events.
+EMAIL_DIGEST_ENABLED = os.environ.get("EMAIL_DIGEST_ENABLED", "true").lower() != "false"
+EMAIL_DIGEST_HOUR = int(os.environ.get("EMAIL_DIGEST_HOUR", "10"))
+
+# Отправители/паттерны, по которым письмо сразу попадает в "срочное" без ИИ-проверки
+GMAIL_DELIVERY_DOMAINS = [
+    "cdek.ru", "5post.ru", "ozon.ru", "market.yandex.ru", "lamoda.ru",
+    "aliexpress.com", "vseinstrumenti.ru", "onlinetrade.ru",
+]
+GMAIL_LINKEDIN_DOMAINS = ["linkedin.com"]
+GMAIL_STOCK_ALERT_KEYWORDS = ["в наличии", "снова доступен", "снова в наличии", "back in stock"]
+
+# Отправители, которым для срочного нужна доп. проверка через ИИ (не любое письмо от них важно)
+GMAIL_AVITO_DOMAINS = ["avito.ru"]
+GMAIL_BANK_DOMAINS = ["tinkoff.ru", "tbank.ru", "sovcombank.ru", "pkobp.pl", "yettel.rs", "yettel.hu"]
+
+# Полностью игнорируем — свои же уведомления безопасности, и Wise (читает, но пока
+# ничего сделать с этим не может)
+GMAIL_SKIP_DOMAINS = ["accounts.google.com", "binance.com", "whoop.com", "wise.com"]
+
+# Особое правило: письма от "ленсбыт" → квитанция (PDF) прикладывается к задаче в Todoist
+GMAIL_LENSBYT_MATCH = "ленсбыт"
+GMAIL_LENSBYT_TODOIST_TASK_SEARCH = "Сарженку"
 
 # Типы напитков, которые можно отмечать. amounts — быстрые кнопки для каждого типа.
 # unit — только для отображения в текстах ("мл"/"шт").
@@ -1006,6 +1032,73 @@ def get_google_access_token(refresh_token: str) -> str:
     return response.json()["access_token"]
 
 
+def list_unread_gmail_messages(max_results: int = 50):
+    access_token = get_google_access_token(GOOGLE_REFRESH_TOKEN)
+    response = httpx.get(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"q": "is:unread in:inbox", "maxResults": max_results},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json().get("messages", [])
+
+
+def get_gmail_message_metadata(message_id: str) -> dict:
+    access_token = get_google_access_token(GOOGLE_REFRESH_TOKEN)
+    response = httpx.get(
+        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"format": "metadata", "metadataHeaders": ["From", "Subject"]},
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    headers = {h["name"]: h["value"] for h in data.get("payload", {}).get("headers", [])}
+    return {
+        "id": message_id,
+        "from": headers.get("From", ""),
+        "subject": headers.get("Subject", ""),
+        "snippet": data.get("snippet", ""),
+    }
+
+
+def get_gmail_message_full(message_id: str) -> dict:
+    access_token = get_google_access_token(GOOGLE_REFRESH_TOKEN)
+    response = httpx.get(
+        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"format": "full"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def find_pdf_attachment(payload: dict) -> dict | None:
+    for part in payload.get("parts", []) or []:
+        filename = part.get("filename", "") or ""
+        if filename.lower().endswith(".pdf") and part.get("body", {}).get("attachmentId"):
+            return {"attachment_id": part["body"]["attachmentId"], "filename": filename}
+        nested = find_pdf_attachment(part)
+        if nested:
+            return nested
+    return None
+
+
+def get_gmail_attachment_bytes(message_id: str, attachment_id: str) -> bytes:
+    access_token = get_google_access_token(GOOGLE_REFRESH_TOKEN)
+    response = httpx.get(
+        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}/attachments/{attachment_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    data = response.json()["data"]
+    padded = data + "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded)
+
+
 def create_google_calendar_event(
     refresh_token: str,
     summary: str,
@@ -1411,6 +1504,48 @@ def create_todoist_task(content: str):
     return response.json()
 
 
+def find_todoist_task_by_text(text: str):
+    response = httpx.get(
+        f"{TODOIST_API_BASE}/tasks/filter",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        params={"query": f"search: {text}"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    results = response.json().get("results", [])
+    return results[0] if results else None
+
+
+def upload_todoist_file(file_bytes: bytes, filename: str) -> dict:
+    response = httpx.post(
+        f"{TODOIST_API_BASE}/uploads",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        files={"file": (filename, file_bytes, "application/pdf")},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def add_todoist_comment_with_attachment(task_id: str, content: str, upload: dict):
+    response = httpx.post(
+        f"{TODOIST_API_BASE}/comments",
+        headers={"Authorization": f"Bearer {TODOIST_TOKEN}"},
+        json={
+            "task_id": task_id,
+            "content": content,
+            "attachment": {
+                "resource_type": "file",
+                "file_url": upload["file_url"],
+                "file_name": upload["file_name"],
+                "file_type": upload.get("file_type", "application/pdf"),
+            },
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+
+
 def close_todoist_task(task_id: str):
     response = httpx.post(
         f"{TODOIST_API_BASE}/tasks/{task_id}/close",
@@ -1709,6 +1844,7 @@ MAIN_KEYBOARD_ROWS = [
     ["💪 WHOOP", "✅ Отметить сделанное"],
     ["💧 Вода", "📊 Статус"],
     ["❤️ Для Саши", "😬 Юля, пей водичку"],
+    ["📬 Почта"],
 ]
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -1726,7 +1862,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status — проверка, что все интеграции живы (Todoist/Calendar/WHOOP)\n"
         "/water — сколько воды выпито сегодня + отметить ещё\n"
         "/birthdays — ближайшие ДР из календаря\n"
-        f"/deadlines — задачи с лейблом «{IMPORTANT_DEADLINE_LABEL}» и приближающимся дедлайном\n\n"
+        f"/deadlines — задачи с лейблом «{IMPORTANT_DEADLINE_LABEL}» и приближающимся дедлайном\n"
+        "/mail — срочное из непрочитанной почты\n\n"
         f"Ежедневная сводка (сегодня/просрочено) приходит в {SEND_TIME} ({TIMEZONE}).\n"
         f"Напоминания про воду — в {', '.join(f'{h}:00' for h in WATER_REMINDER_HOURS)} ({TIMEZONE}).",
         reply_markup=MAIN_KEYBOARD,
@@ -2198,6 +2335,138 @@ def check_important_deadlines() -> list[str]:
     return lines
 
 
+def _sender_domain(from_header: str) -> str:
+    match = re.search(r"@([\w.-]+)", from_header)
+    return match.group(1).lower() if match else ""
+
+
+def classify_gmail_message(msg: dict) -> dict:
+    domain = _sender_domain(msg["from"])
+    from_lower = msg["from"].lower()
+    subject_lower = msg["subject"].lower()
+
+    if any(d in domain for d in GMAIL_SKIP_DOMAINS):
+        return {"bucket": "skip"}
+    if GMAIL_LENSBYT_MATCH in from_lower:
+        return {"bucket": "lensbyt"}
+    if any(k in subject_lower for k in GMAIL_STOCK_ALERT_KEYWORDS):
+        return {"bucket": "urgent", "reason": "товар в наличии"}
+    if any(d in domain for d in GMAIL_LINKEDIN_DOMAINS):
+        return {"bucket": "urgent", "reason": "LinkedIn"}
+    if any(d in domain for d in GMAIL_DELIVERY_DOMAINS):
+        return {"bucket": "urgent", "reason": "посылка"}
+    if any(d in domain for d in GMAIL_AVITO_DOMAINS):
+        return {"bucket": "check_avito"}
+    if any(d in domain for d in GMAIL_BANK_DOMAINS):
+        return {"bucket": "check_bank"}
+    return {"bucket": "check_general"}
+
+
+def classify_email_action_needed(msg: dict, context_hint: str) -> bool:
+    if not DRINK_AI_ENABLED:
+        return False
+    prompt = (
+        f"Письмо: от {msg['from']}, тема: «{msg['subject']}», начало текста: «{msg['snippet']}».\n\n"
+        f"{context_hint}\n\n"
+        'Верни ТОЛЬКО JSON: {"needs_action": true|false}'
+    )
+    result = _call_anthropic_json(prompt)
+    return bool(result and result.get("needs_action"))
+
+
+def handle_lensbyt_email(msg: dict) -> str:
+    task = find_todoist_task_by_text(GMAIL_LENSBYT_TODOIST_TASK_SEARCH)
+    if not task:
+        return f"⚠️ Письмо от ленсбыт («{msg['subject']}»), но не нашла задачу «{GMAIL_LENSBYT_TODOIST_TASK_SEARCH}» в Todoist."
+    try:
+        full = get_gmail_message_full(msg["id"])
+        attachment_info = find_pdf_attachment(full.get("payload", {}))
+        if not attachment_info:
+            return f"✉️ Письмо от ленсбыт («{msg['subject']}») — без PDF-вложения, просто к сведению."
+        pdf_bytes = get_gmail_attachment_bytes(msg["id"], attachment_info["attachment_id"])
+        upload = upload_todoist_file(pdf_bytes, attachment_info["filename"])
+        add_todoist_comment_with_attachment(task["id"], f"Квитанция из письма: {msg['subject']}", upload)
+        return f"📎 Квитанция от ленсбыт добавлена в задачу «{task['content']}»"
+    except Exception:
+        logger.exception("Ошибка обработки письма ленсбыт")
+        return f"⚠️ Не смогла обработать письмо от ленсбыт («{msg['subject']}»)."
+
+
+def build_email_digest_lines() -> list[str]:
+    if not GOOGLE_REFRESH_TOKEN:
+        return []
+    try:
+        messages = list_unread_gmail_messages()
+    except Exception:
+        logger.exception("Ошибка получения списка писем Gmail")
+        return []
+
+    lines = []
+    for m in messages:
+        try:
+            msg = get_gmail_message_metadata(m["id"])
+        except Exception:
+            logger.exception("Ошибка получения письма Gmail")
+            continue
+
+        result = classify_gmail_message(msg)
+        bucket = result["bucket"]
+
+        if bucket == "skip":
+            continue
+        elif bucket == "lensbyt":
+            lines.append(handle_lensbyt_email(msg))
+        elif bucket == "urgent":
+            reason = result.get("reason", "")
+            suffix = f" ({reason})" if reason else ""
+            lines.append(f"🔴 {msg['from']}: {msg['subject']}{suffix}")
+        elif bucket == "check_avito":
+            if classify_email_action_needed(
+                msg,
+                "Это письмо от Avito. Важно только если там про забрать/вернуть товар или получить "
+                "деньги — обычные переписки без конкретного действия не считаются.",
+            ):
+                lines.append(f"🔴 Avito: {msg['subject']}")
+        elif bucket == "check_bank":
+            if classify_email_action_needed(
+                msg,
+                "Это письмо от банка. Важно только если реально требуется действие (оплатить, "
+                "подтвердить, среагировать) — не обычная информационная рассылка или выписка.",
+            ):
+                lines.append(f"🔴 {msg['from']}: {msg['subject']}")
+        elif bucket == "check_general":
+            if classify_email_action_needed(
+                msg,
+                "Обычное письмо не из известного списка отправителей. Определи, ждут ли от Юли "
+                "ответа или какого-то действия прямо сейчас.",
+            ):
+                lines.append(f"✉️ {msg['from']}: {msg['subject']}")
+
+    return lines
+
+
+async def mail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not GOOGLE_REFRESH_TOKEN:
+        await update.message.reply_text("Google-аккаунт не настроен.")
+        return
+    await update.message.reply_text("📬 Проверяю почту...")
+    lines = build_email_digest_lines()
+    if lines:
+        text = "<b>📬 Срочное из почты:</b>\n" + "\n".join(lines)
+    else:
+        text = "📬 В непрочитанных писем ничего срочного не нашла."
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def email_digest_job(app: Application):
+    if not EMAIL_DIGEST_ENABLED:
+        return
+    lines = build_email_digest_lines()
+    if lines:
+        text = "<b>📬 Срочное из почты:</b>\n" + "\n".join(lines)
+        await app.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+
+
 async def deadline_reminder_job(app: Application):
     if not DEADLINE_REMINDERS_ENABLED:
         return
@@ -2322,6 +2591,16 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("⏸️ Claude API — нет ANTHROPIC_API_KEY, распознавание напитков не работает")
 
+    if GOOGLE_REFRESH_TOKEN:
+        try:
+            list_unread_gmail_messages(max_results=1)
+            lines.append("✅ Gmail")
+        except Exception:
+            logger.exception("Ошибка проверки Gmail в /status")
+            lines.append("⚠️ Gmail — не отвечает, возможно у токена нет scope gmail.readonly")
+    else:
+        lines.append("⏸️ Gmail не настроен")
+
     lines.append(f"\n💧 Вода сегодня: {get_water_today_ml()} мл")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -2372,6 +2651,8 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await status_command(update, context)
     elif text == "😬 Юля, пей водичку":
         await report_command(update, context)
+    elif text == "📬 Почта":
+        await mail_command(update, context)
     else:
         drink_results = classify_drinks_from_text(text) if DRINK_AI_ENABLED else []
         if drink_results:
@@ -2398,6 +2679,7 @@ def main():
     app.add_handler(CommandHandler("birthdays", birthdays_command))
     app.add_handler(CommandHandler("addbirthdays", addbirthdays_command))
     app.add_handler(CommandHandler("deadlines", deadlines_command))
+    app.add_handler(CommandHandler("mail", mail_command))
     app.add_handler(CommandHandler("water", water_command))
     app.add_handler(CallbackQueryHandler(drink_button_handler, pattern=r"^drink_\w+_\d+$"))
     app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
@@ -2446,6 +2728,14 @@ def main():
             "cron",
             hour=hour,
             minute=(minute + 20) % 60,
+            args=[app],
+        )
+    if EMAIL_DIGEST_ENABLED:
+        scheduler.add_job(
+            email_digest_job,
+            "cron",
+            hour=EMAIL_DIGEST_HOUR,
+            minute=0,
             args=[app],
         )
     scheduler.start()
