@@ -1744,6 +1744,13 @@ async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(log_classified_drinks(drink_results), parse_mode="HTML")
         return
 
+    if DRINK_AI_ENABLED:
+        result = classify_forwarded_message(text)
+        if result and result.get("type") in ("task", "event", "unclear"):
+            await _handle_forward_result(update, result)
+            return
+
+    # Фолбэк (ИИ недоступен, или классификация не дала ответа) — старое поведение: всё в Todoist
     await update.message.reply_text("Добавляю в Todoist...")
     try:
         create_todoist_task(text)
