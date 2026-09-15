@@ -309,7 +309,12 @@ energy — энергетик, soda — газировка/лимонад/сок
 
 amount — количество. Если не указано явно, оцени разумно:
 вода — обычно 300 (мл), кофе — 1 (шт/чашка, "половинка кофе" тоже считай за 1), энергетик — 1 (шт/банка), \
-газировка/лимонад — 330 (мл, "стакан" ~250)."""
+газировка/лимонад — 330 (мл, "стакан" ~250).
+
+ВАЖНО про единицы: coffee и energy считаются ШТУКАМИ (порциями), а не миллилитрами — если в сообщении \
+указан объём в мл для кофе/энергетика (например "300 мл эспрессо тоник", "500 мл колы... то есть латте"), \
+НЕ используй это число как amount — amount для coffee/energy почти всегда 1 (или явно указанное количество \
+порций, например "два кофе" → amount 2), а не объём в мл. Объём в мл относится только к water и soda."""
 
 
 def _call_anthropic(content) -> list[dict]:
@@ -1305,8 +1310,11 @@ def format_calendar_section(calendars) -> str:
         start = e.get("start", {})
         time_str = ""
         if "dateTime" in start:
-            # Формат: 2026-08-15T14:00:00+03:00 — берём только часы:минуты
-            time_str = start["dateTime"][11:16] + " — "
+            try:
+                event_dt = datetime.fromisoformat(start["dateTime"]).astimezone(tz)
+                time_str = event_dt.strftime("%H:%M") + " — "
+            except ValueError:
+                time_str = start["dateTime"][11:16] + " — "
         return f"• {time_str}{title}"
 
     lines = []
@@ -2646,8 +2654,15 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         drink_results = classify_drinks_from_text(text) if DRINK_AI_ENABLED else []
         if drink_results:
             await update.message.reply_text(log_classified_drinks(drink_results), parse_mode="HTML")
-        else:
-            await update.message.reply_text("Не поняла, воспользуйся кнопками внизу.")
+            return
+
+        if DRINK_AI_ENABLED:
+            result = classify_forwarded_message(text)
+            if result and result.get("type") in ("task", "event", "unclear"):
+                await _handle_forward_result(update, result)
+                return
+
+        await update.message.reply_text("Не поняла, воспользуйся кнопками внизу.")
 
 
 def main():
