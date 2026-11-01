@@ -16,6 +16,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import notion_sync
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -2667,6 +2668,10 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Группа «Юлечкины Сохраненки» → Notion. Стоит первым: сообщения из групп
+    # дальше в остальные обработчики не попадают.
+    notion_sync.register(app)
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("tasks", tasks_command))
