@@ -29,6 +29,7 @@ from telegram import Update
 from telegram.ext import (
     Application,
     MessageHandler,
+    CommandHandler,
     ApplicationHandlerStop,
     filters,
     ContextTypes,
@@ -72,7 +73,8 @@ DATABASES = {
             '"title": название книги (если на фото обложка — прочитай название с неё); для подборки — короткое название подборки.\n'
             '"author": автор книги, если понятно, иначе "".\n'
             '"summary": о чём книга, 1–2 предложения; для подборки — перечисли книги из неё.\n'
-            '"format": "Подборка", если в сообщении несколько книг, иначе "Книга".'
+            '"format": "Подборка", если в сообщении несколько книг, иначе "Книга".\n'
+            '"original_title": название книги на языке оригинала (если знаешь точно), иначе "".'
         ),
     },
     "films": {
@@ -162,16 +164,29 @@ DATABASES = {
         "id": "2828b592238f4402b3e2f67485feb821",
         "title_prop": "Название",
         "has_topic": True,
+        "topic_prop": "Страна / тема",
         "extra": {
             "type": ("Тип", "select"),
         },
         "prompt": (
-            "Это заметка про страну/город/место, игру, мотивацию или что-то разное.\n"
+            "Это заметка про страну/город/место (Сербия, Израиль, Франция, Петербург), игру или что-то разное.\n"
             '"title": короткое понятное название.\n'
             '"summary": суть в 1–2 предложениях.\n'
             '"type": одно из ["Место", "Услуга", "Событие", "Полезное", "Вдохновение", "Другое"].'
         ),
     },
+}
+
+DATABASES["quotes"] = {
+    "id": "d9803ce66ba2479fb3d0a5bd85d98f29",
+    "title_prop": "Название",
+    "has_topic": True,
+    "extra": {},
+    "prompt": (
+        "Это цитата, мотивирующая мысль, мем или картинка для настроения.\n"
+        '"title": сама цитата или главная фраза (если на картинке текст — перепиши его), до 100 символов.\n'
+        '"summary": перевод на русский, если цитата на другом языке, или автор/источник; иначе одна фраза о смысле.'
+    ),
 }
 
 # Тема в Telegram → (база, подпись для поля «Тема TG»). Сопоставление по началу названия.
@@ -196,8 +211,8 @@ TOPIC_RULES = [
     ("israel", "places", "Israel"),
     ("france", "places", "France"),
     ("st.p", "places", "St.P (and RU)"),
-    ("game", "places", "Games"),  # тема изначально называлась «Gamed»
-    ("motivation", "places", "Motivation"),
+    ("game", "places", "Games"),
+    ("motivation", "quotes", "Motivation"),  # тема изначально называлась «Gamed»
     ("other", "places", "Other"),
 ]
 
@@ -277,7 +292,7 @@ async def fetch_link_info(url: str) -> str:
 async def ask_claude(db_key: str, topic_label: str | None, text: str, link_info: str,
                      source: str, image_b64: str | None) -> dict | None:
     db = DATABASES[db_key]
-    keys = ["title", "summary"] + list(db["extra"].keys())
+    keys = ["title", "summary"] + list(db["extra"].keys()) + (["original_title"] if db_key == "books" else [])
     instructions = (
         "Ты разбираешь заметку, которую Юля сохранила в Telegram, и раскладываешь её в базу Notion.\n"
         f"Тема в Telegram: {topic_label or 'Recepts'}.\n"
@@ -323,6 +338,39 @@ async def ask_claude(db_key: str, topic_label: str | None, text: str, link_info:
         return None
 
 
+# ---------- Обложки книг ----------
+
+async def find_book_cover(title: str, author: str = "", original_title: str = "") -> str | None:
+    """Ищет обложку: Google Books, затем Open Library. Возвращает https-ссылку или None."""
+    titles = [t for t in [title, original_title] if t]
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        for t in titles:
+            q = f'intitle:{t}' + (f' inauthor:{author.split(",")[0]}' if author else "")
+            for query in (q, f'intitle:{t}'):
+                try:
+                    r = await client.get("https://www.googleapis.com/books/v1/volumes",
+                                         params={"q": query, "maxResults": 5, "printType": "books"})
+                    for item in (r.json().get("items") or []):
+                        links = item.get("volumeInfo", {}).get("imageLinks") or {}
+                        url = links.get("thumbnail") or links.get("smallThumbnail")
+                        if url:
+                            url = url.replace("http://", "https://").replace("&edge=curl", "")
+                            return url.replace("zoom=1", "zoom=2") if "zoom=1" in url else url
+                except Exception:
+                    logger.info(f"Google Books не ответил для «{t}»")
+            try:
+                params = {"title": t, "limit": 5}
+                if author:
+                    params["author"] = author.split(",")[0]
+                r = await client.get("https://openlibrary.org/search.json", params=params)
+                for doc in (r.json().get("docs") or []):
+                    if doc.get("cover_i"):
+                        return f"https://covers.openlibrary.org/b/id/{doc['cover_i']}-L.jpg"
+            except Exception:
+                logger.info(f"Open Library не ответил для «{t}»")
+    return None
+
+
 # ---------- Notion ----------
 
 def _rt(value: str) -> list:
@@ -354,7 +402,8 @@ async def already_saved(db_key: str, msg_key: str) -> bool:
 
 
 async def create_notion_page(db_key: str, topic_label: str | None, parsed: dict, url: str | None,
-                             date_iso: str, msg_key: str, original_text: str, source: str) -> str:
+                             date_iso: str, msg_key: str, original_text: str, source: str,
+                             cover_url: str | None = None) -> str:
     db = DATABASES[db_key]
     title = (parsed.get("title") or "").strip() or (original_text[:80] if original_text else "Без названия")
     props = {
@@ -365,8 +414,10 @@ async def create_notion_page(db_key: str, topic_label: str | None, parsed: dict,
     }
     if url:
         props["Ссылка"] = {"url": url[:2000]}
+    if cover_url and db_key == "books":
+        props["Обложка"] = {"files": [{"name": "cover.jpg", "type": "external", "external": {"url": cover_url}}]}
     if db["has_topic"] and topic_label:
-        props["Тема TG"] = {"select": {"name": topic_label}}
+        props[db.get("topic_prop", "Тема TG")] = {"select": {"name": topic_label}}
     for key, (prop, kind) in db["extra"].items():
         val = (parsed.get(key) or "").strip() if isinstance(parsed.get(key), str) else ""
         if not val:
@@ -386,7 +437,8 @@ async def create_notion_page(db_key: str, topic_label: str | None, parsed: dict,
         r = await client.post(
             "https://api.notion.com/v1/pages",
             headers=_notion_headers(),
-            json={"parent": {"database_id": db["id"]}, "properties": props, "children": children},
+            json={"parent": {"database_id": db["id"]}, "properties": props, "children": children,
+                  **({"cover": {"type": "external", "external": {"url": cover_url}}} if cover_url else {})},
         )
     if r.status_code >= 400:
         raise RuntimeError(f"Notion {r.status_code}: {r.text[:300]}")
@@ -413,7 +465,11 @@ async def process_item(topic_name: str, text: str, image_b64: str | None, date_i
         if not (text or url):
             return "failed"
         parsed = {"title": "", "summary": ""}  # всё равно сохраняем ссылку/текст, чтобы не потерять
-    await create_notion_page(db_key, label, parsed, url, date_iso, msg_key, text or "", source)
+    cover_url = None
+    if db_key == "books" and (parsed.get("format") or "Книга") == "Книга" and parsed.get("title"):
+        cover_url = await find_book_cover(parsed.get("title", ""), parsed.get("author", ""),
+                                          parsed.get("original_title", ""))
+    await create_notion_page(db_key, label, parsed, url, date_iso, msg_key, text or "", source, cover_url)
     return "saved"
 
 
@@ -528,6 +584,54 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         raise ApplicationHandlerStop
 
 
+def _plain(prop: dict) -> str:
+    items = prop.get("title") or prop.get("rich_text") or []
+    return "".join(i.get("plain_text", "") for i in items).strip()
+
+
+async def bookcovers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/bookcovers — проставить обложки книгам, у которых их ещё нет."""
+    msg = update.effective_message
+    if not NOTION_TOKEN:
+        await msg.reply_text("Нет NOTION_TOKEN")
+        raise ApplicationHandlerStop
+    await msg.reply_text("Ищу обложки для книг без картинки…")
+    found, missed, cursor = 0, [], None
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            body = {"filter": {"property": "Формат", "select": {"equals": "Книга"}}, "page_size": 100}
+            if cursor:
+                body["start_cursor"] = cursor
+            r = await client.post(f"https://api.notion.com/v1/databases/{DATABASES['books']['id']}/query",
+                                  headers=_notion_headers(), json=body)
+            data = r.json()
+            for page in data.get("results", []):
+                props = page["properties"]
+                if (props.get("Обложка", {}).get("files") or []):
+                    continue
+                title = _plain(props.get("Название", {}))
+                author = _plain(props.get("Автор", {}))
+                cover = await find_book_cover(title, author)
+                if cover:
+                    await client.patch(f"https://api.notion.com/v1/pages/{page['id']}", headers=_notion_headers(),
+                                       json={"cover": {"type": "external", "external": {"url": cover}},
+                                             "properties": {"Обложка": {"files": [{"name": "cover.jpg",
+                                                 "type": "external", "external": {"url": cover}}]}}})
+                    found += 1
+                else:
+                    missed.append(title)
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+    text = f"Готово: обложки найдены для {found} книг."
+    if missed:
+        text += "\nНе нашла: " + "; ".join(missed[:20])
+    await msg.reply_text(text)
+    raise ApplicationHandlerStop
+
+
 def register(app: Application):
     """Подключение: вызвать в main() bot.py ДО остальных add_handler."""
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, group_message_handler), group=-1)
+    app.add_handler(CommandHandler("bookcovers", bookcovers_command,
+                                   filters=filters.ChatType.PRIVATE & filters.User(OWNER_ID)), group=-1)
